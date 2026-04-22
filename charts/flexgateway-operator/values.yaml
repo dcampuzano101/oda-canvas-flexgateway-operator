@@ -1,0 +1,24 @@
+replicaCount: 1
+
+image:
+  repository: ""          # e.g. docker.io/yourorg/flexgateway-operator
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# Anypoint credentials — stored in a K8s Secret
+anypointSecret:
+  name: flexgateway-anypoint-creds
+  clientId: ""
+  clientSecret: ""
+
+# Operator configuration — all values required, set per deployment
+operator:
+  anypointOrgId: ""
+  anypointEnvId: ""
+  anypointHost: ""        # anypoint.mulesoft.com | eu1.anypoint.mulesoft.com | ca1.anypoint.mulesoft.com | jp1.anypoint.mulesoft.com
+  flexGwTargetId: ""      # CloudHub 2.0 Private Space target ID
+  flexGwName: ""          # Name of the pre-provisioned Managed Flex Gateway
+  keycloakJwksUrl: ""     # Canvas Keycloak JWKS endpoint
+  keycloakAudience: ""    # JWT aud claim value
+  logging: "INFO"
+  istioIngressHost: ""    # Override Istio discovery for local testing — leave empty in production

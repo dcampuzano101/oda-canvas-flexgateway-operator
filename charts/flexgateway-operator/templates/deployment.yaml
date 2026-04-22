@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-flexgateway-operator
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-flexgateway-operator
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-flexgateway-operator
+    spec:
+      serviceAccountName: flexgateway-operator-sa
+      containers:
+        - name: flexgateway-operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: ANYPOINT_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.anypointSecret.name }}
+                  key: ANYPOINT_CLIENT_ID
+            - name: ANYPOINT_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.anypointSecret.name }}
+                  key: ANYPOINT_CLIENT_SECRET
+            - name: ANYPOINT_ORG_ID
+              value: {{ .Values.operator.anypointOrgId | quote }}
+            - name: ANYPOINT_ENV_ID
+              value: {{ .Values.operator.anypointEnvId | quote }}
+            - name: ANYPOINT_HOST
+              value: {{ .Values.operator.anypointHost | quote }}
+            - name: FLEX_GW_TARGET_ID
+              value: {{ .Values.operator.flexGwTargetId | quote }}
+            - name: FLEX_GW_NAME
+              value: {{ .Values.operator.flexGwName | quote }}
+            - name: KEYCLOAK_JWKS_URL
+              value: {{ .Values.operator.keycloakJwksUrl | quote }}
+            - name: KEYCLOAK_AUDIENCE
+              value: {{ .Values.operator.keycloakAudience | quote }}
+            - name: LOGGING
+              value: {{ .Values.operator.logging | quote }}
