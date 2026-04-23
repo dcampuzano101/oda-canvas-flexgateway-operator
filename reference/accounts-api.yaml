@@ -1,0 +1,377 @@
+openapi: 3.0.0
+info:
+  version: 1.0.0
+  title: te-ai-des-accounts-api
+  description: CRUD API for managing accounts stored in a MySQL database (demodb).
+servers:
+  - url: http://localhost:8081/api
+    description: Local development server
+paths:
+  /accounts:
+    get:
+      summary: List all accounts
+      operationId: getAccounts
+      parameters:
+        - name: accountType
+          in: query
+          required: false
+          description: Filter by account type
+          schema:
+            type: string
+            enum:
+              - checkings
+              - savings
+              - brokerage
+        - name: city
+          in: query
+          required: false
+          description: Filter by city
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: false
+          description: Filter by state code
+          schema:
+            type: string
+            maxLength: 50
+      responses:
+        "200":
+          description: List of accounts returned successfully.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Account"
+              example:
+                - accountId: "1000000001"
+                  fromDate: "2023-01-15"
+                  toDate: "2025-12-31"
+                  firstName: Michael
+                  lastName: Scott
+                  address: 1725 Slough Ave
+                  city: Scranton
+                  state: PA
+                  zipCode: "18503"
+                  email: mscott@dundermifflin.com
+                  title: Regional Manager
+                  phone: "(570) 555-0100"
+                  accountType: checkings
+                  created_at: "2026-02-14T15:41:37Z"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      summary: Create a new account
+      operationId: createAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountInput"
+            example:
+              fromDate: "2023-01-15"
+              toDate: "2025-12-31"
+              firstName: Michael
+              lastName: Scott
+              address: 1725 Slough Ave
+              city: Scranton
+              state: PA
+              zipCode: "18503"
+              email: mscott@dundermifflin.com
+              title: Regional Manager
+              phone: "(570) 555-0100"
+              accountType: checkings
+      responses:
+        "201":
+          description: Account created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "400":
+          description: Bad request — invalid or missing fields.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /accounts/{accountId}:
+    parameters:
+      - name: accountId
+        in: path
+        required: true
+        description: Unique account identifier.
+        schema:
+          type: string
+          maxLength: 20
+    get:
+      summary: Get an account by ID
+      operationId: getAccountById
+      responses:
+        "200":
+          description: Account found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "404":
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    put:
+      summary: Update an existing account
+      operationId: updateAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountInput"
+      responses:
+        "200":
+          description: Account updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "400":
+          description: Bad request — invalid or missing fields.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      summary: Delete an account
+      operationId: deleteAccount
+      responses:
+        "204":
+          description: Account deleted successfully.
+        "404":
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  schemas:
+    Account:
+      type: object
+      properties:
+        accountId:
+          type: string
+          maxLength: 20
+          description: Unique account identifier.
+          example: "1000000001"
+        fromDate:
+          type: string
+          format: date
+          description: Account start date.
+          example: "2023-01-15"
+        toDate:
+          type: string
+          format: date
+          description: Account end date.
+          example: "2025-12-31"
+        firstName:
+          type: string
+          maxLength: 100
+          description: Account holder first name.
+          example: Michael
+        lastName:
+          type: string
+          maxLength: 100
+          description: Account holder last name.
+          example: Scott
+        address:
+          type: string
+          maxLength: 255
+          description: Street address.
+          example: 1725 Slough Ave
+        city:
+          type: string
+          maxLength: 100
+          description: City.
+          example: Scranton
+        state:
+          type: string
+          maxLength: 50
+          description: State code.
+          example: PA
+        zipCode:
+          type: string
+          maxLength: 20
+          description: ZIP code.
+          example: "18503"
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          nullable: true
+          description: Email address.
+          example: mscott@dundermifflin.com
+        title:
+          type: string
+          maxLength: 255
+          nullable: true
+          description: Job title.
+          example: Regional Manager
+        phone:
+          type: string
+          maxLength: 30
+          nullable: true
+          description: Phone number.
+          example: "(570) 555-0100"
+        accountType:
+          type: string
+          description: Type of account.
+          enum:
+            - savings
+            - checkings
+            - brokerage
+          example: checkings
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Record creation timestamp (auto-generated).
+          example: "2026-02-14T15:41:37Z"
+      required:
+        - accountId
+        - fromDate
+        - toDate
+        - firstName
+        - lastName
+        - address
+        - city
+        - state
+        - zipCode
+        - accountType
+    AccountInput:
+      type: object
+      description: Payload for creating or updating an account (accountId and created_at are generated server-side).
+      properties:
+        fromDate:
+          type: string
+          format: date
+          description: Account start date.
+          example: "2023-01-15"
+        toDate:
+          type: string
+          format: date
+          description: Account end date.
+          example: "2025-12-31"
+        firstName:
+          type: string
+          maxLength: 100
+          description: Account holder first name.
+          example: Michael
+        lastName:
+          type: string
+          maxLength: 100
+          description: Account holder last name.
+          example: Scott
+        address:
+          type: string
+          maxLength: 255
+          description: Street address.
+          example: 1725 Slough Ave
+        city:
+          type: string
+          maxLength: 100
+          description: City.
+          example: Scranton
+        state:
+          type: string
+          maxLength: 50
+          description: State code.
+          example: PA
+        zipCode:
+          type: string
+          maxLength: 20
+          description: ZIP code.
+          example: "18503"
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          nullable: true
+          description: Email address.
+          example: mscott@dundermifflin.com
+        title:
+          type: string
+          maxLength: 255
+          nullable: true
+          description: Job title.
+          example: Regional Manager
+        phone:
+          type: string
+          maxLength: 30
+          nullable: true
+          description: Phone number.
+          example: "(570) 555-0100"
+        accountType:
+          type: string
+          description: Type of account.
+          enum:
+            - savings
+            - checkings
+            - brokerage
+          example: checkings
+      required:
+        - fromDate
+        - toDate
+        - firstName
+        - lastName
+        - address
+        - city
+        - state
+        - zipCode
+        - accountType
+    ErrorResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          description: Human-readable error message.
+          example: Account not found.
+        errorCode:
+          type: string
+          description: Application-specific error code.
+          example: ACCOUNT_NOT_FOUND
