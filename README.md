@@ -1,8 +1,9 @@
 # MuleSoft Flex Gateway — ODA Canvas API Operator
 
 A Kubernetes operator that watches `ExposedAPI` CRDs (`oda.tmforum.org/v1`) and automatically
-configures a **Managed Flex Gateway in CloudHub 2.0** to host A2A agents and MCP servers. Built
-as the MuleSoft contribution to the TM Forum Project Foundation AI-Native ODA Canvas.
+configures a **Managed Flex Gateway in CloudHub 2.0** to host A2A agents, MCP servers, and
+OpenAPI REST services. Built as the MuleSoft contribution to the TM Forum Project Foundation
+AI-Native ODA Canvas.
 
 ---
 
@@ -12,12 +13,11 @@ When an ODA Component is deployed to the Canvas, the Component Operator creates 
 custom resources. This operator watches those resources and — for each one — provisions the
 following in Anypoint Platform:
 
-1. **Publishes an Exchange asset** (type `mcp` or `agent`) with the API's metadata
-2. **Creates an API instance** in API Manager with the correct endpoint type (`mcp` or `a2a`)
+1. **Publishes an Exchange asset** (`mcp`, `agent`, or `rest-api`) with the API's metadata and spec
+2. **Creates an API instance** in API Manager with the correct endpoint type
 3. **Deploys** the instance to the pre-provisioned Managed Flex Gateway
-4. **Applies a deterministic policy set** based on `apiType`
-5. **Writes `status.url`** back to the ExposedAPI CRD — the DependentAPI controller reads
-   this to wire service-to-service URLs through the gateway
+4. **Applies a policy set** driven by a K8s ConfigMap (falls back to built-in defaults)
+5. **Writes `status.url`** back to the ExposedAPI CRD — the DependentAPI controller reads this to wire service-to-service URLs through the gateway
 
 ### Traffic Flow
 
@@ -31,54 +31,54 @@ External Consumer / Agent
 
 ### Supported API Types
 
-| `spec.apiType` | Exchange type | Endpoint type | Agentic policies applied |
+| `spec.apiType` | Exchange type | Endpoint type | Policies applied |
 |---|---|---|---|
-| `mcp` | `mcp` | `mcp` | MCP Support, Agent Connection Telemetry |
-| `a2a` | `agent` | `a2a` | A2A Agent Card, Agent Connection Telemetry |
-
-All instances receive: **JWT Validation** (Keycloak JWKS), **Distributed Tracing**, **Header Injection**.
-
----
-
-## Architecture
-
-```
-ODA Canvas (Kubernetes)              CloudHub 2.0 (MuleSoft)
-┌─────────────────────────┐         ┌──────────────────────┐
-│  Component Operator     │         │  Managed Flex Gateway│
-│    ↓ creates            │         │  (pre-provisioned)   │
-│  ExposedAPI CRD         │──────→  │                      │
-│    ↓ watched by         │ configures via Anypoint APIs   │
-│  apiOperatorFlexGateway │         └──────────────────────┘
-│    ↓ writes             │
-│  status.url             │         Anypoint Platform
-└─────────────────────────┘         ┌──────────────────────┐
-                                    │  API Manager         │
-                                    │  Exchange            │
-                                    │  Gateway Manager     │
-                                    └──────────────────────┘
-```
+| `mcp` | `mcp` | `mcp` | JWT Validation, Tracing, Header Injection, MCP Support, Agent Connection Telemetry |
+| `a2a` | `agent` (+ A2A card) | `a2a` | JWT Validation, Tracing, Header Injection, A2A Agent Card, Agent Connection Telemetry |
+| `openapi` | `rest-api` (+ OAS spec) | `http` | Rate Limiting (if enabled), CORS (if enabled), JWT Validation, Tracing, Header Injection |
 
 ---
 
 ## Directory Structure
 
 ```
-blueprint-mule-v2/
-  operator/
-    apiOperatorFlexGateway.py   # kopf operator — CRD watch loop + provisioning logic
-    anypoint_client.py          # Anypoint Platform REST API client
-    policy_mapper.py            # ExposedAPI spec → Anypoint policy payload mapper
-    requirements.txt            # Python dependencies
-    Dockerfile                  # python:3.11-slim
-  charts/
-    flexgateway-operator/       # Helm chart for deploying the operator to K8s
-      Chart.yaml
-      values.yaml               # All configurable values with comments
-      templates/
-        secret.yaml             # K8s Secret for Anypoint credentials
-        rbac.yaml               # ServiceAccount + ClusterRole + ClusterRoleBinding
-        deployment.yaml         # Operator Deployment
+oda-canvas-flexgateway-operator/
+│
+├── operator/
+│   ├── apiOperatorFlexGateway.py   # kopf operator — CRD watch loop, Exchange publish,
+│   │                               #   API instance create/deploy, policy application,
+│   │                               #   status writeback, delete cleanup
+│   ├── anypoint_client.py          # Anypoint Platform REST API client
+│   │                               #   (auth, gateway, API Manager, Exchange, policies)
+│   ├── policy_mapper.py            # Policy config builder — maps ExposedAPI spec fields
+│   │                               #   to Anypoint policy payloads per asset ID
+│   ├── requirements.txt            # Python 3.11 dependencies
+│   └── Dockerfile                  # python:3.11-slim image
+│
+├── charts/
+│   └── flexgateway-operator/       # Helm chart — deploy operator to ODA Canvas cluster
+│       ├── Chart.yaml
+│       ├── values.yaml             # All operator config + policy templates
+│       └── templates/
+│           ├── secret.yaml         # K8s Secret: ANYPOINT_CLIENT_ID/SECRET
+│           ├── rbac.yaml           # ServiceAccount + ClusterRole (watches exposedapis)
+│           ├── deployment.yaml     # Operator Deployment (env vars from secret + values)
+│           └── policy-templates.yaml  # ConfigMap: which policies to apply per apiType
+│
+└── reference/
+    └── accounts-api.yaml           # Sample OAS 3.0 spec (te-ai-des-accounts-api)
+                                    #   used by the openapi ExposedAPI test manifest
+```
+
+### How the pieces connect
+
+```
+ExposedAPI CRD event
+  → apiOperatorFlexGateway.py (kopf handler)
+      → anypoint_client.py    (all Anypoint REST calls)
+      → policy_mapper.py      (build config payload per policy asset ID)
+      → K8s ConfigMap         (flexgateway-policy-templates — which policies to apply)
+      → K8s status patch      (writes status.url back to ExposedAPI)
 ```
 
 ---
@@ -97,7 +97,7 @@ blueprint-mule-v2/
 
 ### Kubernetes
 - ODA Canvas CRD installed: `exposedapis.oda.tmforum.org`
-- The operator needs a ServiceAccount with permissions to watch `exposedapis` and patch their status
+- `"a2a"` must be in the CRD enum for `spec.apiType` (patch if needed — see Testing section)
 
 ---
 
@@ -114,64 +114,247 @@ blueprint-mule-v2/
 | `FLEX_GW_NAME` | Yes | Name of the pre-provisioned Managed Flex Gateway |
 | `KEYCLOAK_JWKS_URL` | Yes | Keycloak JWKS endpoint (e.g. `https://.../certs`) |
 | `KEYCLOAK_AUDIENCE` | Yes | Expected JWT `aud` claim value |
+| `OPERATOR_NAMESPACE` | No | Namespace where the policy templates ConfigMap lives (default: `operators`) |
 | `LOGGING` | No | Log level (default: `INFO`) |
-| `ISTIO_INGRESS_HOST` | No | Override Istio ingress discovery — used for local testing without Istio |
+| `ISTIO_INGRESS_HOST` | No | Override Istio ingress discovery — set for local testing without Istio |
 
 ---
 
-## Running Locally (Phase B — kind cluster)
+## Local Testing (kind cluster)
+
+### 1. Cluster setup
 
 ```bash
-# 1. Create a local cluster
+# Install kind if needed
+brew install kind
+
+# Create local cluster
 kind create cluster --name oda-canvas-test
 
-# 2. Install the ExposedAPI CRD
-kubectl apply -f /path/to/oda-canvas/charts/oda-crds/templates/oda-exposedapi-crd.yaml
+# Install the ExposedAPI CRD from the ODA Canvas repo
+kubectl apply -f /path/to/oda-canvas/charts/oda-crds/templates/oda-exposedapi-crd.yaml --context kind-oda-canvas-test
 
-# 3. Create namespace
-kubectl create namespace components
+# Patch CRD to allow "a2a" apiType (not in all CRD versions)
+kubectl get crd exposedapis.oda.tmforum.org -o json --context kind-oda-canvas-test \
+  | python3 -c "
+import json, sys
+crd = json.load(sys.stdin)
+for ver in crd['spec']['versions']:
+    enum = ver['schema']['openAPIV3Schema']['properties']['spec']['properties']['apiType'].get('enum', [])
+    if 'a2a' not in enum:
+        enum.append('a2a')
+        ver['schema']['openAPIV3Schema']['properties']['spec']['properties']['apiType']['enum'] = enum
+print(json.dumps(crd))
+" | kubectl apply -f - --context kind-oda-canvas-test
 
-# 4. Set up Python 3.11 venv
+# Create required namespaces
+kubectl create namespace components --context kind-oda-canvas-test
+kubectl create namespace operators --context kind-oda-canvas-test
+```
+
+### 2. Operator setup
+
+```bash
 cd operator
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-# 5. Run the operator
-ANYPOINT_CLIENT_ID=... \
-ANYPOINT_CLIENT_SECRET=... \
-ANYPOINT_ORG_ID=... \
-ANYPOINT_ENV_ID=... \
+### 3. Run the operator
+
+```bash
+ANYPOINT_CLIENT_ID=<your-client-id> \
+ANYPOINT_CLIENT_SECRET=<your-client-secret> \
+ANYPOINT_ORG_ID=<your-org-id> \
+ANYPOINT_ENV_ID=<your-env-id> \
 ANYPOINT_HOST=anypoint.mulesoft.com \
-FLEX_GW_TARGET_ID=... \
-FLEX_GW_NAME=... \
-KEYCLOAK_JWKS_URL=... \
-KEYCLOAK_AUDIENCE=... \
-ISTIO_INGRESS_HOST=<real-or-test-hostname> \
+FLEX_GW_TARGET_ID=<your-private-space-target-id> \
+FLEX_GW_NAME=<your-gateway-name> \
+KEYCLOAK_JWKS_URL=<your-jwks-url> \
+KEYCLOAK_AUDIENCE=<your-audience> \
+ISTIO_INGRESS_HOST=example.com \
 kopf run --standalone apiOperatorFlexGateway.py
+```
 
-# 6. Apply a test ExposedAPI
-kubectl apply -f - <<EOF
+> `ISTIO_INGRESS_HOST=example.com` bypasses Istio discovery for local testing. In production, leave this unset and the operator discovers the real Istio ingress external IP automatically.
+
+### 4. Apply test ExposedAPIs
+
+Three test manifests are provided — apply any or all:
+
+```bash
+# MCP Server
+kubectl apply -f - --context kind-oda-canvas-test <<EOF
 apiVersion: oda.tmforum.org/v1
 kind: ExposedAPI
 metadata:
-  name: my-mcp-server
+  name: pc-2-productcatalogmcp
   namespace: components
 spec:
-  name: My MCP Server
+  name: productcatalogmcp
   apiType: mcp
-  implementation: my-mcp-service
-  path: /my-component/mcp
+  implementation: pc-2-prodcatmcp
+  path: /pc-2-productcatalogmanagement/mcp
   port: 8080
 EOF
+
+# A2A Agent
+kubectl apply -f - --context kind-oda-canvas-test <<EOF
+apiVersion: oda.tmforum.org/v1
+kind: ExposedAPI
+metadata:
+  name: pa-1-productagent-agentquery
+  namespace: components
+spec:
+  name: productcatalogagent
+  apiType: a2a
+  implementation: pa-1-agent
+  path: /pa-1-productagent/v1/agent
+  port: 8000
+EOF
+
+# OpenAPI REST service (OAS spec fetched from reference/accounts-api.yaml in this repo)
+kubectl apply -f - --context kind-oda-canvas-test <<EOF
+apiVersion: oda.tmforum.org/v1
+kind: ExposedAPI
+metadata:
+  name: te-accounts-api
+  namespace: components
+spec:
+  name: te-ai-des-accounts-api
+  apiType: openapi
+  implementation: te-accounts-service
+  path: /te-ai-des-accounts-api/v1
+  port: 8081
+  specification:
+    url: "https://raw.githubusercontent.com/dcampuzano101/oda-canvas-flexgateway-operator/main/reference/accounts-api.yaml"
+  rateLimit:
+    enabled: true
+    identifier: IP
+    limit: "100"
+    interval: pm
+EOF
+```
+
+### 5. Verify provisioning
+
+```bash
+# Check status was written
+kubectl get exposedapi <name> -n components \
+  -o jsonpath='{.status}' --context kind-oda-canvas-test | python3 -m json.tool
+
+# Key fields to confirm
+kubectl get exposedapi <name> -n components \
+  -o jsonpath='{.status.url}' --context kind-oda-canvas-test     # gateway public URL
+
+kubectl get exposedapi <name> -n components \
+  -o jsonpath='{.status.implementation.ready}' --context kind-oda-canvas-test  # true
+
+# Then verify in Anypoint API Manager — the API instance should appear under
+# "Agent and Tool Instances" with the correct endpoint type and policies
+```
+
+### 6. Test delete (cleanup)
+
+```bash
+kubectl delete exposedapi <name> -n components --context kind-oda-canvas-test
+# Operator log: [OK] Deleted API instance <id> for <name>
+# API instance is removed from Anypoint API Manager
 ```
 
 ---
 
-## Deploying via Helm (Phase C — ODA Canvas cluster)
+## Policy Templates
+
+The operator applies policies driven by a Kubernetes ConfigMap named `flexgateway-policy-templates`
+in the `operators` namespace. If the ConfigMap is absent, the operator falls back to built-in
+defaults (same policy set as the ConfigMap defaults in `charts/flexgateway-operator/values.yaml`).
+
+### Apply the default ConfigMap
 
 ```bash
-# Dry-run
+kubectl apply -f - --context kind-oda-canvas-test <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flexgateway-policy-templates
+  namespace: operators
+data:
+  mcp: |
+    - assetId: jwt-validation
+      minorVersion: "0.11"
+    - assetId: tracing
+      minorVersion: "1.1"
+    - assetId: header-injection
+      minorVersion: "1.3"
+    - assetId: mcp-support
+      minorVersion: "1.0"
+    - assetId: agent-connection-telemetry
+      minorVersion: "1.0"
+  a2a: |
+    - assetId: jwt-validation
+      minorVersion: "0.11"
+    - assetId: tracing
+      minorVersion: "1.1"
+    - assetId: header-injection
+      minorVersion: "1.3"
+    - assetId: a-two-a-agent-card
+      minorVersion: "1.0"
+    - assetId: agent-connection-telemetry
+      minorVersion: "1.0"
+  openapi: |
+    - assetId: rate-limiting
+      minorVersion: "1.4"
+      condition: rateLimit.enabled
+    - assetId: cors
+      minorVersion: "1.0"
+      condition: CORS.enabled
+    - assetId: jwt-validation
+      minorVersion: "0.11"
+    - assetId: tracing
+      minorVersion: "1.1"
+    - assetId: header-injection
+      minorVersion: "1.3"
+EOF
+```
+
+### Verify the ConfigMap is being used
+
+On the next ExposedAPI reconciliation the operator logs:
+```
+Loaded policy templates from ConfigMap operators/flexgateway-policy-templates
+```
+vs. without ConfigMap:
+```
+Policy templates ConfigMap not found — using built-in defaults
+```
+
+### Test ConfigMap-driven behavior
+
+Edit the ConfigMap to remove a policy (e.g. remove `agent-connection-telemetry` from `mcp`),
+save it, then delete and re-apply an MCP ExposedAPI. The removed policy will not be applied —
+no operator restart needed.
+
+Supported `assetId` values and their conditions:
+
+| `assetId` | Config source | Condition field |
+|---|---|---|
+| `jwt-validation` | `KEYCLOAK_JWKS_URL` + `KEYCLOAK_AUDIENCE` env vars | — |
+| `tracing` | `spec.name` + `api_id` | — |
+| `header-injection` | `api_id` | — |
+| `mcp-support` | (empty config) | — |
+| `a-two-a-agent-card` | (hardcoded card path) | — |
+| `agent-connection-telemetry` | (header expression) | — |
+| `rate-limiting` | `spec.rateLimit.*` | `rateLimit.enabled` |
+| `cors` | `spec.CORS.*` | `CORS.enabled` |
+
+---
+
+## Deploying via Helm (ODA Canvas cluster)
+
+```bash
+# Dry-run to validate templates render correctly
 helm install flexgateway-operator charts/flexgateway-operator \
   --dry-run --debug \
   --set anypointSecret.clientId=<id> \
@@ -192,35 +375,35 @@ helm install flexgateway-operator charts/flexgateway-operator \
   --namespace operators --create-namespace
 ```
 
+The Helm chart deploys the operator Deployment, RBAC, credentials Secret, and the
+`flexgateway-policy-templates` ConfigMap in a single install. Policies can be updated
+post-install by editing the ConfigMap directly without a Helm upgrade.
+
 ---
 
 ## What Gets Provisioned Per ExposedAPI
 
 | Resource | Location | Notes |
 |---|---|---|
-| Exchange asset | Anypoint Exchange | Named after `metadata.name`; type `mcp` or `agent` |
-| API instance | Anypoint API Manager | `instanceLabel` = `metadata.name`; `endpoint.type` = `mcp` or `a2a` |
+| Exchange asset | Anypoint Exchange | Named `metadata.name`; type matches `apiType` |
+| API instance | Anypoint API Manager | `instanceLabel` = `metadata.name`; `endpoint.type` = `mcp`/`a2a`/`http` |
+| OAS spec (openapi only) | Exchange asset | Fetched from `spec.specification.url` at provision time |
 | Gateway deployment | Managed Flex Gateway | `type: HY` (hybrid) |
-| JWT Validation policy | API instance | JWKS from Keycloak; injects `X-Agent-Scopes`, `X-Agent-Client-Id` headers |
-| Distributed Tracing | API instance | OpenTelemetry spans with `mulesoft.api.instance.id` label |
-| Header Injection | API instance | Injects `x-anypoint-api-instance-id` for telemetry correlation |
-| MCP Support | API instance | MCP type only — handles streamable HTTP transport |
-| A2A Agent Card | API instance | A2A type only — serves `/.well-known/agent-card.json` |
-| Agent Connection Telemetry | API instance | MCP + A2A — tracks agent-to-tool/agent invocations |
+| Policy set | API instance | Driven by `flexgateway-policy-templates` ConfigMap |
 
 ### ExposedAPI Status Written
 
 ```yaml
 status:
-  url: https://<gateway-public-url>/<name>          # read by DependentAPI controller
+  url: https://<gateway-public-url>/<name>       # read by DependentAPI controller
   implementation:
     ready: true
   flexGatewayBind:
     apiInstanceId: "20865826"
     gatewayId: "e9180b69-..."
     apiPublicUrl: https://<gateway-public-url>/<name>
-    policiesApplied: [jwt-validation, tracing, header-injection, mcp-support, agent-connection-telemetry]
-    spec: { ... }                                    # snapshot for idempotency
+    policiesApplied: [jwt-validation, tracing, header-injection, mcp-support, ...]
+    spec: { ... }                                # snapshot used for idempotency check
 ```
 
 ---
@@ -229,6 +412,6 @@ status:
 
 | Phase | Description | Status |
 |---|---|---|
-| **Phase A** | Core Anypoint API logic validated without K8s (Exchange publish, API instance, deploy, policies) | ✅ Complete |
-| **Phase B** | kopf operator loop validated against local kind cluster (create, idempotency, delete, status writeback) | ✅ Complete |
-| **Phase C** | Deploy to ODA Canvas cluster via Helm chart; validate with Component Operator and real ExposedAPIs | ⏳ Pending Canvas team access |
+| **Phase A** | Core Anypoint API logic validated without K8s — Exchange publish (mcp/agent/rest-api), API instance creation, gateway deployment, policy application for all three apiTypes | ✅ Complete |
+| **Phase B** | kopf operator loop validated against local kind cluster — create, resume, update, delete, idempotency, status writeback, policy templates ConfigMap | ✅ Complete |
+| **Phase C** | Deploy to ODA Canvas cluster via Helm chart; validate with Component Operator and real ExposedAPIs | ⏳ Pending Canvas cluster access |
