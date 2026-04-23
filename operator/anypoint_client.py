@@ -421,6 +421,8 @@ class AnypointClient:
         version: str = "1.0.0",
         a2a_card: Optional[bytes] = None,
         agent_metadata: Optional[bytes] = None,
+        oas_content: Optional[bytes] = None,
+        oas_filename: Optional[str] = None,
     ) -> str:
         """
         POST multipart to Exchange to publish an asset.
@@ -446,6 +448,23 @@ class AnypointClient:
                  ("a2a-card.json", a2a_card, "application/json")),
                 ("files.agent-metadata.json",
                  ("agent-metadata.json", agent_metadata, "application/json")),
+            ]
+        if oas_content and oas_filename:
+            ext = oas_filename.lower()
+            classifier = "files.oas.yaml" if ext.endswith((".yaml", ".yml")) else "files.oas.json"
+            mime = "application/yaml" if ext.endswith((".yaml", ".yml")) else "application/json"
+            # Extract apiVersion from spec content; fall back to "v1"
+            api_version = "1.0.0"
+            try:
+                import yaml as _yaml
+                parsed = _yaml.safe_load(oas_content)
+                api_version = parsed.get("info", {}).get("version", "1.0.0")
+            except Exception:
+                pass
+            files += [
+                (classifier,              (oas_filename, oas_content, mime)),
+                ("properties.mainFile",   (None, oas_filename)),
+                ("properties.apiVersion", (None, str(api_version))),
             ]
         resp = requests.post(url, headers=self._auth_header, files=files)
         if not resp.ok:

@@ -3,6 +3,8 @@ import logging
 import os
 import threading
 
+import requests as _requests
+
 import kopf
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -47,16 +49,18 @@ def _safe_logging_handle(self, record):
 logging.Handler.handle = _safe_logging_handle
 
 # ── apiType mappings ───────────────────────────────────────────────────────────
-_SUPPORTED_API_TYPES = {"mcp", "a2a"}
+_SUPPORTED_API_TYPES = {"mcp", "a2a", "openapi"}
 
 _ENDPOINT_TYPE = {
-    "mcp": "mcp",
-    "a2a": "a2a",
+    "mcp":     "mcp",
+    "a2a":     "a2a",
+    "openapi": "http",
 }
 
 _EXCHANGE_TYPE = {
-    "mcp": "mcp",
-    "a2a": "agent",
+    "mcp":     "mcp",
+    "a2a":     "agent",
+    "openapi": "rest-api",
 }
 
 
@@ -162,6 +166,18 @@ def _build_a2a_card(
     return json.dumps(card).encode(), json.dumps(metadata).encode()
 
 
+def _fetch_spec_content(url: str) -> tuple:
+    """Fetch OAS spec bytes from URL. Returns (content, filename) or (None, None)."""
+    try:
+        resp = _requests.get(url, timeout=10)
+        resp.raise_for_status()
+        filename = url.split("/")[-1] or "spec.yaml"
+        return resp.content, filename
+    except Exception as e:
+        logger.warning("Could not fetch OAS spec from %s: %s", url, e)
+        return None, None
+
+
 # ── Create / Resume / Update ───────────────────────────────────────────────────
 @kopf.on.resume(GROUP, VERSION, APIS_PLURAL, retries=5)
 @kopf.on.create(GROUP, VERSION, APIS_PLURAL, retries=5)
@@ -218,10 +234,20 @@ def manage_exposedapi(spec, name, namespace, status, **kwargs):
     # ── Publish Exchange asset (idempotent) ────────────────────────────────────
     if not anypoint.exchange_asset_exists(name):
         a2a_card = a2a_meta = None
+        oas_content = oas_filename = None
+
         if api_spec["apiType"] == "a2a":
             a2a_card, a2a_meta = _build_a2a_card(
                 api_spec["name"], name, upstream_url
             )
+        elif api_spec["apiType"] == "openapi":
+            spec_url = spec.get("specification", {}).get("url") if spec.get("specification") else None
+            if spec_url:
+                oas_content, oas_filename = _fetch_spec_content(spec_url)
+            if not oas_content:
+                logger.warning("[%s] No OAS spec available — falling back to http-api Exchange type", name)
+                exchange_type = "http-api"
+
         try:
             status_url = anypoint.publish_exchange_asset(
                 name=api_spec["name"],
@@ -229,6 +255,8 @@ def manage_exposedapi(spec, name, namespace, status, **kwargs):
                 exchange_type=exchange_type,
                 a2a_card=a2a_card,
                 agent_metadata=a2a_meta,
+                oas_content=oas_content,
+                oas_filename=oas_filename,
             )
             anypoint.wait_for_exchange_publish(status_url)
             logger.info("[OK] Exchange asset published: %s (%s)", name, exchange_type)
