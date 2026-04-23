@@ -254,6 +254,81 @@ def build_jwt_validation_policy(
 
 
 # ------------------------------------------------------------------
+# Policy config dispatcher — used by template-driven policy application
+# ------------------------------------------------------------------
+
+def build_policy_config(
+    asset_id: str,
+    spec: dict,
+    api_id,
+    jwks_url: str = "",
+    audience: str = "",
+) -> dict | None:
+    """
+    Return the configurationData dict for a given policy asset_id.
+    Returns None for unknown policies (caller should skip).
+    """
+    if asset_id == "jwt-validation":
+        jwt = build_jwt_validation_policy(jwks_url, audience)
+        return jwt["configurationData"]
+
+    if asset_id == "rate-limiting":
+        rate_limit = spec.get("rateLimit", {})
+        identifier = rate_limit.get("identifier", "IP")
+        key_expr = {
+            "IP": "#[attributes.remoteAddress]",
+            "header": "#[attributes.headers['client_id']]",
+        }.get(identifier, "#[attributes.remoteAddress]")
+        return {
+            "rateLimits": [{
+                "maximumRequests": int(rate_limit.get("limit", 100)),
+                "timePeriodInMilliseconds": _interval_ms(rate_limit.get("interval", "pm")),
+            }],
+            "keySelector": key_expr,
+            "clusterizable": True,
+            "exposeHeaders": True,
+        }
+
+    if asset_id == "cors":
+        cors = spec.get("CORS", {})
+        return {
+            "allowCredentials": cors.get("allowCredentials", False),
+            "origins": cors.get("allowOrigins", "*"),
+            "methods": "GET,POST,PUT,DELETE,OPTIONS",
+            "headers": "Content-Type,Authorization",
+            "exposedHeaders": "",
+            "maxAge": 3600,
+        }
+
+    if asset_id == "tracing":
+        return {
+            "spanName": f"[API] {spec.get('name', 'unknown')}",
+            "sampling": {"client": 100, "random": 100, "overall": 100},
+            "labels": [
+                {"type": "literal", "name": "mulesoft.api.instance.id", "defaultValue": str(api_id)},
+                {"type": "literal", "name": "mulesoft.api.type", "defaultValue": spec.get("apiType", "openapi")},
+            ],
+        }
+
+    if asset_id == "header-injection":
+        return {
+            "inboundHeaders": [{"key": "x-anypoint-api-instance-id", "value": str(api_id)}],
+            "outboundHeaders": [],
+        }
+
+    if asset_id == "a-two-a-agent-card":
+        return {"cardPath": "/.well-known/agent-card.json"}
+
+    if asset_id == "agent-connection-telemetry":
+        return {"sourceAgentId": "#[attributes.headers['x-anypoint-api-instance-id']]"}
+
+    if asset_id == "mcp-support":
+        return {}
+
+    return None
+
+
+# ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
 

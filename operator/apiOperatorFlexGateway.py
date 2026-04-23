@@ -4,6 +4,7 @@ import os
 import threading
 
 import requests as _requests
+import yaml as _yaml
 
 import kopf
 from kubernetes import client, config
@@ -11,6 +12,8 @@ from kubernetes.client.rest import ApiException
 
 from anypoint_client import AnypointClient
 from policy_mapper import (
+    MULESOFT_ORG,
+    build_policy_config,
     build_jwt_validation_policy,
     map_tier1_policies,
     map_tier2_policies,
@@ -62,6 +65,71 @@ _EXCHANGE_TYPE = {
     "a2a":     "agent",
     "openapi": "rest-api",
 }
+
+
+# ── Default policy templates (fallback when ConfigMap is absent) ───────────────
+_DEFAULT_POLICY_TEMPLATES = {
+    "mcp": [
+        {"assetId": "jwt-validation",           "minorVersion": "0.11"},
+        {"assetId": "tracing",                  "minorVersion": "1.1"},
+        {"assetId": "header-injection",         "minorVersion": "1.3"},
+        {"assetId": "mcp-support",              "minorVersion": "1.0"},
+        {"assetId": "agent-connection-telemetry","minorVersion": "1.0"},
+    ],
+    "a2a": [
+        {"assetId": "jwt-validation",           "minorVersion": "0.11"},
+        {"assetId": "tracing",                  "minorVersion": "1.1"},
+        {"assetId": "header-injection",         "minorVersion": "1.3"},
+        {"assetId": "a-two-a-agent-card",       "minorVersion": "1.0"},
+        {"assetId": "agent-connection-telemetry","minorVersion": "1.0"},
+    ],
+    "openapi": [
+        {"assetId": "rate-limiting",  "minorVersion": "1.4", "condition": "rateLimit.enabled"},
+        {"assetId": "cors",           "minorVersion": "1.0", "condition": "CORS.enabled"},
+        {"assetId": "jwt-validation", "minorVersion": "0.11"},
+        {"assetId": "tracing",        "minorVersion": "1.1"},
+        {"assetId": "header-injection","minorVersion": "1.3"},
+    ],
+}
+
+POLICY_TEMPLATES_CONFIGMAP = "flexgateway-policy-templates"
+OPERATOR_NAMESPACE = os.environ.get("OPERATOR_NAMESPACE", "operators")
+
+
+def _load_policy_templates() -> dict:
+    """
+    Read policy templates from the flexgateway-policy-templates ConfigMap.
+    Falls back to _DEFAULT_POLICY_TEMPLATES if the ConfigMap is absent.
+    """
+    try:
+        try:
+            config.load_incluster_config()
+        except config.ConfigException:
+            config.load_kube_config()
+        v1 = client.CoreV1Api()
+        cm = v1.read_namespaced_config_map(POLICY_TEMPLATES_CONFIGMAP, OPERATOR_NAMESPACE)
+        templates = {k: _yaml.safe_load(v) for k, v in cm.data.items()}
+        logger.info("Loaded policy templates from ConfigMap %s/%s",
+                    OPERATOR_NAMESPACE, POLICY_TEMPLATES_CONFIGMAP)
+        return templates
+    except ApiException as e:
+        if e.status == 404:
+            logger.info("Policy templates ConfigMap not found — using built-in defaults")
+        else:
+            logger.warning("Could not read policy templates ConfigMap: %s — using defaults", e)
+    except Exception as e:
+        logger.warning("Error loading policy templates: %s — using defaults", e)
+    return _DEFAULT_POLICY_TEMPLATES
+
+
+def _condition_met(condition: str, api_spec: dict) -> bool:
+    """Evaluate a dot-notation condition path against api_spec (e.g. 'rateLimit.enabled')."""
+    val = api_spec
+    for key in condition.split("."):
+        if not isinstance(val, dict):
+            return False
+        val = val.get(key)
+    return bool(val)
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────
@@ -286,29 +354,31 @@ def manage_exposedapi(spec, name, namespace, status, **kwargs):
     # ── Deploy to gateway ──────────────────────────────────────────────────────
     anypoint.deploy_to_gateway(api_id, gw_id, FLEX_GW_NAME)
 
-    # ── Apply policies ─────────────────────────────────────────────────────────
+    # ── Apply policies (template-driven) ──────────────────────────────────────
+    templates = _load_policy_templates()
+    policy_list = templates.get(api_spec["apiType"], [])
     policies_applied = []
 
-    for policy in map_tier1_policies(api_spec):
-        version = anypoint.resolve_policy_version(
-            policy["groupId"], policy["assetId"], policy["minorVersion"]
-        )
-        anypoint.apply_policy(api_id, policy["assetId"], version,
-                              policy["groupId"], policy["config"])
-        policies_applied.append(policy["assetId"])
+    for policy_def in policy_list:
+        asset_id = policy_def["assetId"]
+        minor_version = policy_def.get("minorVersion", "1.0")
+        condition = policy_def.get("condition")
 
-    jwt = build_jwt_validation_policy(KEYCLOAK_JWKS_URL, KEYCLOAK_AUDIENCE)
-    anypoint.apply_policy(api_id, jwt["assetId"], jwt["assetVersion"],
-                          jwt["groupId"], jwt["configurationData"])
-    policies_applied.append("jwt-validation")
+        if condition and not _condition_met(condition, api_spec):
+            continue
 
-    for policy in map_tier2_policies(api_spec, api_id=api_id):
-        version = anypoint.resolve_policy_version(
-            policy["groupId"], policy["assetId"], policy["minorVersion"]
+        policy_config = build_policy_config(
+            asset_id, api_spec, api_id,
+            jwks_url=KEYCLOAK_JWKS_URL,
+            audience=KEYCLOAK_AUDIENCE,
         )
-        anypoint.apply_policy(api_id, policy["assetId"], version,
-                              policy["groupId"], policy["config"])
-        policies_applied.append(policy["assetId"])
+        if policy_config is None:
+            logger.warning("[%s] Unknown policy '%s' in template — skipping", name, asset_id)
+            continue
+
+        version = anypoint.resolve_policy_version(MULESOFT_ORG, asset_id, minor_version)
+        anypoint.apply_policy(api_id, asset_id, version, MULESOFT_ORG, policy_config)
+        policies_applied.append(asset_id)
 
     logger.info("[%s] Policies applied: %s", name, policies_applied)
 

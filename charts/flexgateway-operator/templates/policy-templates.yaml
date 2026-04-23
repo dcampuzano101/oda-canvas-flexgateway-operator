@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flexgateway-policy-templates
+  namespace: {{ .Release.Namespace }}
+data:
+  mcp: |
+    {{- toYaml .Values.policyTemplates.mcp | nindent 4 }}
+  a2a: |
+    {{- toYaml .Values.policyTemplates.a2a | nindent 4 }}
+  openapi: |
+    {{- toYaml .Values.policyTemplates.openapi | nindent 4 }}

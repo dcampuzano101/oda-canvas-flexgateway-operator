@@ -22,3 +22,43 @@ operator:
   keycloakAudience: ""    # JWT aud claim value
   logging: "INFO"
   istioIngressHost: ""    # Override Istio discovery for local testing — leave empty in production
+
+# Policy templates — define which policies to apply per apiType.
+# Edit these values or patch the ConfigMap directly after deployment.
+# If the ConfigMap is deleted, the operator falls back to built-in defaults.
+policyTemplates:
+  mcp:
+    - assetId: jwt-validation
+      minorVersion: "0.11"
+    - assetId: tracing
+      minorVersion: "1.1"
+    - assetId: header-injection
+      minorVersion: "1.3"
+    - assetId: mcp-support
+      minorVersion: "1.0"
+    - assetId: agent-connection-telemetry
+      minorVersion: "1.0"
+  a2a:
+    - assetId: jwt-validation
+      minorVersion: "0.11"
+    - assetId: tracing
+      minorVersion: "1.1"
+    - assetId: header-injection
+      minorVersion: "1.3"
+    - assetId: a-two-a-agent-card
+      minorVersion: "1.0"
+    - assetId: agent-connection-telemetry
+      minorVersion: "1.0"
+  openapi:
+    - assetId: rate-limiting
+      minorVersion: "1.4"
+      condition: rateLimit.enabled
+    - assetId: cors
+      minorVersion: "1.0"
+      condition: CORS.enabled
+    - assetId: jwt-validation
+      minorVersion: "0.11"
+    - assetId: tracing
+      minorVersion: "1.1"
+    - assetId: header-injection
+      minorVersion: "1.3"
