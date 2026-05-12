@@ -13,7 +13,7 @@ spec:
       labels:
         app: {{ .Release.Name }}-flexgateway-operator
     spec:
-      serviceAccountName: flexgateway-operator-sa
+      serviceAccountName: {{ .Release.Name }}-flexgateway-operator-sa
       containers:
         - name: flexgateway-operator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -43,5 +43,15 @@ spec:
               value: {{ .Values.operator.keycloakJwksUrl | quote }}
             - name: KEYCLOAK_AUDIENCE
               value: {{ .Values.operator.keycloakAudience | quote }}
+            - name: ISTIO_INGRESS_HOST
+              value: {{ .Values.operator.istioIngressHost | quote }}
+            - name: ISTIO_SECRET_NAME
+              value: {{ .Values.operator.istioSecretName | quote }}
+            - name: ISTIO_SECRET_NAMESPACE
+              value: {{ .Values.operator.istioSecretNamespace | quote }}
+            - name: GATEWAY_TLS_SECRET_NAME
+              value: {{ .Values.operator.gatewayTlsSecretName | quote }}
+            - name: OPERATOR_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
             - name: LOGGING
               value: {{ .Values.operator.logging | quote }}

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import hashlib
 
 import requests as _requests
 import yaml as _yaml
@@ -34,7 +35,11 @@ FLEX_GW_TARGET_ID      = os.environ["FLEX_GW_TARGET_ID"]
 FLEX_GW_NAME           = os.environ["FLEX_GW_NAME"]
 KEYCLOAK_JWKS_URL      = os.environ["KEYCLOAK_JWKS_URL"]
 KEYCLOAK_AUDIENCE      = os.environ["KEYCLOAK_AUDIENCE"]
-
+ISTIO_SECRET_NAME      = os.environ.get("ISTIO_SECRET_NAME")
+ISTIO_SECRET_NAMESPACE = os.environ.get("ISTIO_SECRET_NAMESPACE", "istio-ingress")
+GATEWAY_TLS_SECRET_NAME = os.environ.get("GATEWAY_TLS_SECRET_NAME")
+MANAGE_OUTBOUND_TLS     = bool(ISTIO_SECRET_NAME and GATEWAY_TLS_SECRET_NAME)
+        
 logging_level = os.environ.get("LOGGING", "INFO")
 logger = logging.getLogger("apiOperatorFlexGateway")
 logger.setLevel(getattr(logging, logging_level.upper(), logging.INFO))
@@ -121,7 +126,79 @@ def _load_policy_templates() -> dict:
         logger.warning("Error loading policy templates: %s — using defaults", e)
     return _DEFAULT_POLICY_TEMPLATES
 
+def _parse_template_ref(template_ref: str) -> tuple[str, str]:
+    """
+    Parse gatewayConfiguration.template.
+    Expected format:
+      <configmap-name>/<key.yaml>
+    Example:
+      productcatalog-flexgateway-templates/openapi.yaml
+    """
+    if not template_ref or "/" not in template_ref:
+        raise kopf.PermanentError(
+            "gatewayConfiguration.template must use format '<configmap-name>/<key.yaml>'"
+        )
+    
+    cm_name, key = template_ref.split("/", 1)
 
+    if not cm_name or not key:
+        raise kopf.PermanentError(
+            "gatewayConfiguration.template must use format '<configmap-name>/<key.yaml>'"
+        )
+
+    return cm_name, key
+
+def _load_policy_template_from_ref(template_ref: str, namespace: str) -> tuple[list, str]:
+    """
+    Load a policy template from a ConfigMap referenced by gatewayConfiguration.template.
+    Returns:
+      policy_list, template_digest
+    """
+    cm_name, key = _parse_template_ref(template_ref)
+
+    try:
+        try:
+            config.load_incluster_config()
+        except config.ConfigException:
+            config.load_kube_config()
+
+        v1 = client.CoreV1Api()
+        cm = v1.read_namespaced_config_map(cm_name, namespace)
+
+        if not cm.data or key not in cm.data:
+            raise kopf.PermanentError(
+                f"Template key '{key}' not found in ConfigMap '{namespace}/{cm_name}'"
+            )
+
+        raw_template = cm.data[key]
+        policy_list = _yaml.safe_load(raw_template)
+
+        if not isinstance(policy_list, list):
+            raise kopf.PermanentError(
+                f"Template '{template_ref}' must contain a YAML list of policy definitions"
+            )
+
+        template_digest = hashlib.sha256(raw_template.encode("utf-8")).hexdigest()
+
+        logger.info(
+            "Loaded policy template %s from ConfigMap %s/%s",
+            key,
+            namespace,
+            cm_name,
+        )
+
+        return policy_list, template_digest
+
+    except ApiException as e:
+        if e.status == 404:
+            raise kopf.PermanentError(
+                f"Template ConfigMap '{namespace}/{cm_name}' not found"
+            )
+        raise kopf.TemporaryError(
+            f"Could not read template ConfigMap '{namespace}/{cm_name}': {e}",
+            delay=30,
+        )
+    
 def _condition_met(condition: str, api_spec: dict) -> bool:
     """Evaluate a dot-notation condition path against api_spec (e.g. 'rateLimit.enabled')."""
     val = api_spec
@@ -136,6 +213,15 @@ def _condition_met(condition: str, api_spec: dict) -> bool:
 @kopf.on.startup()
 def configure(settings: kopf.OperatorSettings, **_):
     settings.watching.server_timeout = 60
+
+    settings.persistence.finalizer = "oda.tmforum.org/flexgateway-operator-finalizer"
+    settings.persistence.progress_storage = kopf.AnnotationsProgressStorage(
+        prefix="flexgateway.oda.tmforum.org"
+    )
+    settings.persistence.diffbase_storage = kopf.AnnotationsDiffBaseStorage(
+        prefix="flexgateway.oda.tmforum.org",
+        key="last-handled-configuration",
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -174,6 +260,54 @@ def _get_istio_ingress_host() -> str:
         logger.error("Istio ingress discovery failed: %s", e)
     return ""
 
+def _resolve_upstream_url(spec: dict, name: str) -> str:
+    """
+    Resolve the upstream URL that Flex Gateway should forward to.
+
+    Use istio ingress host + spec.path
+    """
+    istio_host = _get_istio_ingress_host()
+    if not istio_host:
+        raise kopf.TemporaryError("No Istio ingressgateway external IP found", delay=30)
+
+    path = spec.get("path") or "/"
+    upstream_url = _join_url("https", istio_host, path, trailing_slash=True)
+
+    logger.info(
+        "[%s] Upstream URL resolution: istio_host=%s path=%r trailing_slash=True upstream_url=%r endswith_slash=%s",
+        name,
+        istio_host,
+        path,
+        upstream_url,
+        upstream_url.endswith("/"),
+    )
+    return upstream_url
+
+def _join_url(scheme: str, host: str, path: str, trailing_slash: bool = False) -> str:
+    host = host.rstrip("/")
+    path = path or "/"
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    if trailing_slash:
+        path = path.rstrip("/") + "/"
+
+    if host.startswith("http://") or host.startswith("https://"):
+        result = f"{host.rstrip('/')}{path}"
+    else:
+        result = f"{scheme}://{host}{path}"
+ 
+    logger.info(
+        "URL join: scheme=%s host=%r path=%r trailing_slash=%s result=%r endswith_slash=%s",
+        scheme,
+        host,
+        path,
+        trailing_slash,
+        result,
+        result.endswith("/"),
+    )
+    return result
 
 def _ensure_gateway(anypoint: AnypointClient) -> tuple[str, str]:
     """Return (gateway_id, gateway_public_url) for the pre-provisioned Flex Gateway."""
@@ -245,52 +379,158 @@ def _fetch_spec_content(url: str) -> tuple:
         logger.warning("Could not fetch OAS spec from %s: %s", url, e)
         return None, None
 
+def _has_flex_template(spec, **_):
+    return bool(
+        spec.get("gatewayConfiguration", {}).get("template")
+        or spec.get("template")
+    )
 
 # ── Create / Resume / Update ───────────────────────────────────────────────────
-@kopf.on.resume(GROUP, VERSION, APIS_PLURAL, retries=5)
-@kopf.on.create(GROUP, VERSION, APIS_PLURAL, retries=5)
-@kopf.on.update(GROUP, VERSION, APIS_PLURAL, retries=5)
-def manage_exposedapi(spec, name, namespace, status, **kwargs):
-    api_spec = {
-        "name":           spec.get("name"),
-        "apiType":        spec.get("apiType"),
-        "implementation": spec.get("implementation"),
-        "path":           spec.get("path"),
-        "port":           spec.get("port"),
-        "rateLimit":      dict(spec.get("rateLimit", {})),
-        "CORS":           dict(spec.get("CORS", {})),
-    }
+@kopf.on.resume(GROUP, VERSION, APIS_PLURAL, retries=5, when=_has_flex_template)
+@kopf.on.create(GROUP, VERSION, APIS_PLURAL, retries=5, when=_has_flex_template)
+@kopf.on.field(GROUP, VERSION, APIS_PLURAL, field="spec", retries=5, when=_has_flex_template)
+def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwargs):
+    template_ref = (
+        spec.get("gatewayConfiguration", {}).get("template")
+        or spec.get("template")
+    )
+    if not template_ref:
+        logger.info("[SKIP] %s — no gatewayConfiguration.template or template specified, skipping policy application", name)
+        return    
 
-    # ── Idempotency check ──────────────────────────────────────────────────────
-    stored = status.get("flexGatewayBind", {}).get("spec")
-    if stored == api_spec:
-        logger.info("[SKIP] %s — spec unchanged, no-op", name)
-        return
+    specification_url = (
+        spec.get("specification", {}).get("url")
+        if spec.get("specification") 
+        else None
+    )
+
+    api_spec = {
+        "name":             spec.get("name"),
+        "apiType":          spec.get("apiType"),
+        "implementation":   spec.get("implementation"),
+        "path":             spec.get("path"),
+        "port":             spec.get("port"),
+        "rateLimit":        dict(spec.get("rateLimit", {})),
+        "CORS":             dict(spec.get("CORS", {})),
+        "specificationUrl": specification_url,
+        "templateRef":      template_ref,
+    }
 
     # ── Validate required fields ───────────────────────────────────────────────
     for field in ("name", "apiType", "path"):
         if not api_spec.get(field):
             raise kopf.PermanentError(f"ExposedAPI '{name}' missing required field: spec.{field}")
-
+    
     if api_spec["apiType"] not in _SUPPORTED_API_TYPES:
-        raise kopf.PermanentError(
-            f"ExposedAPI '{name}' has unsupported apiType '{api_spec['apiType']}'. "
-            f"This operator handles: {sorted(_SUPPORTED_API_TYPES)}"
+        logger.info(
+            "[SKIP] %s - apiType '%s' is not handled by Flex Gateway operator",
+            name,
+            api_spec["apiType"],
+        )
+        return
+
+    # ── Load policy template before idempotency check ──────────────────────────
+    template_digest = None
+
+    if template_ref:
+        policy_list, template_digest = _load_policy_template_from_ref(template_ref, namespace)
+        for policy in policy_list:
+            if "assetId" not in policy:
+                raise kopf.PermanentError(
+                    f"Invalid policy definition in template '{template_ref}': missing 'assetId'"
+                )
+    else:
+        templates = _load_policy_templates()
+        policy_list = templates.get(api_spec["apiType"], [])
+        template_digest = hashlib.sha256(_yaml.safe_dump(policy_list).encode("utf-8")).hexdigest()
+
+    desired_state = {
+        **api_spec,
+        "templateDigest": template_digest,
+    }
+
+    # ── Discover Istio ingress ─────────────────────────────────────────────────
+#    istio_host = _get_istio_ingress_host()
+#    if not istio_host:
+#        raise kopf.TemporaryError("No Istio ingressgateway external IP found", delay=30)
+#    upstream_url = f"https://{istio_host}{spec['path']}"
+#    logger.info("[%s] Upstream URL: %s", name, upstream_url)
+
+    # ── Resolve upstream URL through existing Canvas/Istio exposure ────────────────
+    upstream_url = _resolve_upstream_url(spec, name)
+
+    desired_state["upstreamUrl"] = upstream_url
+    logger.info(
+        "[%s] Desired upstreamUrl set: %r endswith_slash=%s",
+        name,
+        desired_state["upstreamUrl"],
+        desired_state["upstreamUrl"].endswith("/"),
+    )
+
+    # ── Idempotency check ──────────────────────────────────────────────────────
+    stored_upstream_url = (
+        status.get("flexGatewayBind", {})
+        .get("desiredState", {})
+        .get("upstreamUrl")
+    )
+    stored = status.get("flexGatewayBind", {}).get("desiredState")
+    logger.info(
+        "[%s] Idempotency check: stored_upstreamUrl=%r stored_endswith_slash=%s desired_upstreamUrl=%r desired_endswith_slash=%s stored_equals_desired=%s",
+        name,
+        stored_upstream_url,
+        stored_upstream_url.endswith("/") if isinstance(stored_upstream_url, str) else None,
+        upstream_url,
+        upstream_url.endswith("/"),
+        stored == desired_state,
+    )
+
+    current_api_status_url = status.get("apiStatus", {}).get("url")
+    current_flex_gw_url = status.get("flexGatewayBind", {}).get("apiPublicUrl")
+
+    if (
+        stored == desired_state
+        and current_flex_gw_url
+        and current_api_status_url == current_flex_gw_url
+    ):
+        logger.info("[SKIP] %s — desired state and public URL unchanged, no-op", name)
+        return    
+
+    status_only_drift = (
+        stored == desired_state
+        and current_flex_gw_url
+        and current_api_status_url != current_flex_gw_url
+    )
+
+    if status_only_drift:
+        logger.info(
+            "[%s] Public URL drift detected; restoring Flex Gateway URL without Anypoint calls",
+            name,
         )
 
+        existing_api_status = dict(status.get("apiStatus", {}))
+        existing_api_status["url"] = current_flex_gw_url
+
+        status_body = {
+            "status": {
+                "apiStatus": existing_api_status,
+            }
+        }
+
+        try:
+            coa = client.CustomObjectsApi()
+            coa.patch_namespaced_custom_object(
+                GROUP, VERSION, namespace, APIS_PLURAL, name, status_body
+            )
+            logger.info("[%s] Restored apiStatus.url=%s", name, current_flex_gw_url)
+        except ApiException as e:
+            logger.warning("[%s] Failed to restore apiStatus.url: %s", name, e)
+        return
     # ── Authenticate ───────────────────────────────────────────────────────────
     anypoint = _build_client()
     try:
         anypoint.authenticate()
     except Exception as e:
         raise kopf.TemporaryError(f"Anypoint auth failed: {e}", delay=30)
-
-    # ── Discover Istio ingress ─────────────────────────────────────────────────
-    istio_host = _get_istio_ingress_host()
-    if not istio_host:
-        raise kopf.TemporaryError("No Istio ingressgateway external IP found", delay=30)
-    upstream_url = f"https://{istio_host}{spec['path']}"
-    logger.info("[%s] Upstream URL: %s", name, upstream_url)
 
     # ── Ensure Flex Gateway ────────────────────────────────────────────────────
     gw_id, gw_public_url = _ensure_gateway(anypoint)
@@ -340,6 +580,12 @@ def manage_exposedapi(spec, name, namespace, status, **kwargs):
         api_id = existing["id"]
         logger.info("[SKIP] API instance exists: %s  id=%s", name, api_id)
     else:
+        logger.info(
+            "[%s] Creating API instance with endpoint_uri=%r endpoint_uri_endswith_slash=%s",
+            name,
+            upstream_url,
+            upstream_url.endswith("/"),
+        )
         api = anypoint.create_api_instance(
             spec_asset_id=name,
             endpoint_uri=upstream_url,
@@ -354,9 +600,7 @@ def manage_exposedapi(spec, name, namespace, status, **kwargs):
     # ── Deploy to gateway ──────────────────────────────────────────────────────
     anypoint.deploy_to_gateway(api_id, gw_id, FLEX_GW_NAME)
 
-    # ── Apply policies (template-driven) ──────────────────────────────────────
-    templates = _load_policy_templates()
-    policy_list = templates.get(api_spec["apiType"], [])
+    # ── Apply policies (template-driven) ──────────────────────────────────────    
     policies_applied = []
 
     for policy_def in policy_list:
@@ -375,7 +619,7 @@ def manage_exposedapi(spec, name, namespace, status, **kwargs):
         if policy_config is None:
             logger.warning("[%s] Unknown policy '%s' in template — skipping", name, asset_id)
             continue
-
+        
         version = anypoint.resolve_policy_version(MULESOFT_ORG, asset_id, minor_version)
         anypoint.apply_policy(api_id, asset_id, version, MULESOFT_ORG, policy_config)
         policies_applied.append(asset_id)
@@ -384,17 +628,35 @@ def manage_exposedapi(spec, name, namespace, status, **kwargs):
 
     # ── Write status directly via K8s API (bypasses kopf return-value mechanism) ─
     api_public_url = f"{gw_public_url}/{name}"
+
+    existing_api_status = dict(status.get("apiStatus", {}))
+    existing_api_status["url"] = api_public_url
+
+    existing_bind = status.get("flexGatewayBind", {})
+
+    if (
+        existing_bind.get("desiredState") == desired_state
+        and existing_bind.get("apiPublicUrl") == api_public_url
+        and status.get("apiStatus", {}).get("url") == api_public_url
+    ):
+        logger.info("[%s] Status already current, skipping status patch", name)
+        return
+    
     status_body = {
         "status": {
             "flexGatewayBind": {
                 "apiInstanceId":   str(api_id),
                 "gatewayId":       gw_id,
                 "apiPublicUrl":    api_public_url,
+                "upstreamUrl":     upstream_url,
                 "policiesApplied": policies_applied,
+                "templateRef":     template_ref,
+                "templateDigest":  template_digest,
                 "spec":            api_spec,
+                "desiredState":    desired_state,
             },
             "implementation": {"ready": True},
-            "url": api_public_url,
+            "apiStatus": existing_api_status,
         }
     }
     try:
@@ -409,8 +671,21 @@ def manage_exposedapi(spec, name, namespace, status, **kwargs):
 
 # ── Delete ─────────────────────────────────────────────────────────────────────
 @kopf.on.delete(GROUP, VERSION, APIS_PLURAL, retries=1)
-def delete_exposedapi(status, name, **kwargs):
+def delete_exposedapi(status, name, namespace, spec=None, **kwargs):
     api_instance_id = status.get("flexGatewayBind", {}).get("apiInstanceId")
+    api_public_url = status.get("flexGatewayBind", {}).get("apiPublicUrl")
+    template_ref = status.get("flexGatewayBind", {}).get("templateRef")
+
+    logger.info(
+        "[%s] Delete requested namespace=%s apiInstanceId=%s apiPublicUrl=%s templateRef=%s apiType=%s path=%s",
+        name,
+        namespace,
+        api_instance_id or "<none>",
+        api_public_url or "<none>",
+        template_ref or "<none>",
+        (spec or {}).get("apiType"),
+        (spec or {}).get("path"),
+    )
     if not api_instance_id:
         logger.info("[SKIP] %s — no apiInstanceId in status, nothing to clean up", name)
         return
@@ -421,4 +696,5 @@ def delete_exposedapi(status, name, **kwargs):
         anypoint.delete_api_instance(int(api_instance_id))
         logger.info("[OK] Deleted API instance %s for %s", api_instance_id, name)
     except Exception as e:
+        logger.exception("[%s] Delete failed for apiInstanceId=%s", name, api_instance_id)
         raise kopf.TemporaryError(f"Delete failed for {name}: {e}", delay=30)

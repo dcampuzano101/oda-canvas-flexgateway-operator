@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: flexgateway-operator-sa
+  name: {{ .Release.Name }}-flexgateway-operator-sa
   namespace: {{ .Release.Namespace }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: flexgateway-operator-role
+  name: {{ .Release.Name }}-flexgateway-operator-role
 rules:
   # kopf: peering
   - apiGroups: [zalando.org]
@@ -29,16 +29,20 @@ rules:
   - apiGroups: [""]
     resources: [services]
     verbs: [list, get]
+  # ConfigMaps — read component-owned Flex policy templates
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: flexgateway-operator-rolebinding
+  name: {{ .Release.Name }}-flexgateway-operator-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: flexgateway-operator-role
+  name: {{ .Release.Name }}-flexgateway-operator-role
 subjects:
   - kind: ServiceAccount
-    name: flexgateway-operator-sa
+    name: {{ .Release.Name }}-flexgateway-operator-sa
     namespace: {{ .Release.Namespace }}

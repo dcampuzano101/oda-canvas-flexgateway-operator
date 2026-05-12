@@ -1,27 +1,30 @@
 replicaCount: 1
 
 image:
-  repository: ""          # e.g. docker.io/yourorg/flexgateway-operator
-  tag: "latest"
+  repository: "akumartmf/apioperatorflexgateway"          # e.g. docker.io/yourorg/flexgateway-operator
+  tag: "v0.11"
   pullPolicy: IfNotPresent
 
 # Anypoint credentials — stored in a K8s Secret
 anypointSecret:
   name: flexgateway-anypoint-creds
-  clientId: ""
-  clientSecret: ""
+  clientId: "eea....................."
+  clientSecret: "477....................."
 
 # Operator configuration — all values required, set per deployment
 operator:
-  anypointOrgId: ""
-  anypointEnvId: ""
-  anypointHost: ""        # anypoint.mulesoft.com | eu1.anypoint.mulesoft.com | ca1.anypoint.mulesoft.com | jp1.anypoint.mulesoft.com
-  flexGwTargetId: ""      # CloudHub 2.0 Private Space target ID
-  flexGwName: ""          # Name of the pre-provisioned Managed Flex Gateway
-  keycloakJwksUrl: ""     # Canvas Keycloak JWKS endpoint
-  keycloakAudience: ""    # JWT aud claim value
+  anypointOrgId: "0b2ebc55...................." 
+  anypointEnvId: "cbc85e......................"
+  anypointHost: "anypoint.mulesoft.com"        # anypoint.mulesoft.com | eu1.anypoint.mulesoft.com | ca1.anypoint.mulesoft.com | jp1.anypoint.mulesoft.com
+  flexGwTargetId: "3e81818....................."      # CloudHub 2.0 Private Space target ID
+  flexGwName: "oda-canvas-local-gw"          # Name of the pre-provisioned Managed Flex Gateway
+  keycloakJwksUrl: "<host.name>:8083/auth/realms/odari/protocol/openid-connect/certs"     # Canvas Keycloak JWKS endpoint
+  keycloakAudience: "oda-canvas-gateway"    # JWT aud claim value
   logging: "INFO"
   istioIngressHost: ""    # Override Istio discovery for local testing — leave empty in production
+  istioSecretName: "istio-ingress-cert"    # Optional: name of K8s Secret containing TLS certs for Istio ingress
+  istioSecretNamespace: "istio-ingress"   # Namespace of the above Secret
+  gatewayTlsSecretName: "flexgateway-canvas-tls"  # Optional: name of Anypoint Secret containing TLS certs for the gateway — required if the operator manages TLS for the gateway
 
 # Policy templates — define which policies to apply per apiType.
 # Edit these values or patch the ConfigMap directly after deployment.
