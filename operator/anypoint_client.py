@@ -268,15 +268,46 @@ class AnypointClient:
             "type": "HY",
             "environmentId": self.env_id,
         }
-        resp = requests.post(
+        url = (
             f"{self._base}/proxies/xapi/v1/organizations/{self.org_id}"
-            f"/environments/{self.env_id}/apis/{api_id}/deployments",
+            f"/environments/{self.env_id}/apis/{api_id}/deployments"
+        )
+        logger.info(
+            "Deploying API to gateway: api_id=%s gateway_id=%s gateway_name=%s url=%s body=%s",
+            api_id,
+            gateway_id,
+            gateway_name,
+            url,
+            body,
+        )
+        resp = requests.post(
+            url,
             headers=self._headers,
             json=body,
+        )
+        logger.info(
+            "Deploy response: api_id=%s status=%s headers=%s body=%s",
+            api_id,
+            resp.status_code,
+            {
+                "x-request-id": resp.headers.get("x-request-id"),
+                "x-sfdc-request-id": resp.headers.get("x-sfdc-request-id"),
+                "x-anypnt-trx-id": resp.headers.get("x-anypnt-trx-id"),
+                "content-type": resp.headers.get("content-type"),
+            },
+            resp.text[:4000],
         )
         if resp.status_code == 400:
             logger.info("[SKIP] API %s already deployed to gateway (400)", api_id)
             return resp.json() if resp.text else {}
+        if resp.status_code == 502:
+            logger.error(
+                "deploy_to_gateway returned 502. api_id=%s gateway_id=%s gateway_name=%s response=%s",
+                api_id,
+                gateway_id,
+                gateway_name,
+                resp.text[:4000],
+            )
         if not resp.ok:
             logger.error("deploy_to_gateway failed %s: %s", resp.status_code, resp.text)
         resp.raise_for_status()
@@ -441,13 +472,21 @@ class AnypointClient:
             ("name",   (None, name)),
             ("type",   (None, exchange_type)),
             ("status", (None, "published")),
+            ("properties.apiVersion", (None, version)),
         ]
+        #if a2a_card and agent_metadata:
+        #    files += [
+        #        ("files.a2a-card.json",
+        #         ("a2a-card.json", a2a_card, "application/json")),
+        #        ("files.agent-metadata.json",
+        #         ("agent-metadata.json", agent_metadata, "application/json")),
+        #    ]
         if a2a_card and agent_metadata:
             files += [
-                ("files.a2a-card.json",
-                 ("a2a-card.json", a2a_card, "application/json")),
+                ("files.agent-card.json",
+                ("agent-card.json", a2a_card, "application/json")),
                 ("files.agent-metadata.json",
-                 ("agent-metadata.json", agent_metadata, "application/json")),
+                ("agent-metadata.json", agent_metadata, "application/json")),
             ]
         if oas_content and oas_filename:
             ext = oas_filename.lower()
@@ -464,7 +503,6 @@ class AnypointClient:
             files += [
                 (classifier,              (oas_filename, oas_content, mime)),
                 ("properties.mainFile",   (None, oas_filename)),
-                ("properties.apiVersion", (None, str(api_version))),
             ]
         resp = requests.post(url, headers=self._auth_header, files=files)
         if not resp.ok:

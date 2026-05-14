@@ -53,5 +53,7 @@ spec:
               value: {{ .Values.operator.gatewayTlsSecretName | quote }}
             - name: OPERATOR_NAMESPACE
               value: {{ .Release.Namespace | quote }}
+            - name: VERIFY_UPSTREAM_TLS
+              value: {{ .Values.operator.verifyUpstreamTls | quote }}
             - name: LOGGING
               value: {{ .Values.operator.logging | quote }}

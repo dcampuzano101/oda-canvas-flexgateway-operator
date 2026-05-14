@@ -39,6 +39,7 @@ ISTIO_SECRET_NAME      = os.environ.get("ISTIO_SECRET_NAME")
 ISTIO_SECRET_NAMESPACE = os.environ.get("ISTIO_SECRET_NAMESPACE", "istio-ingress")
 GATEWAY_TLS_SECRET_NAME = os.environ.get("GATEWAY_TLS_SECRET_NAME")
 MANAGE_OUTBOUND_TLS     = bool(ISTIO_SECRET_NAME and GATEWAY_TLS_SECRET_NAME)
+VERIFY_UPSTREAM_TLS     = os.environ.get("VERIFY_UPSTREAM_TLS", "false").lower() == "true"
         
 logging_level = os.environ.get("LOGGING", "INFO")
 logger = logging.getLogger("apiOperatorFlexGateway")
@@ -367,16 +368,38 @@ def _build_a2a_card(
     }
     return json.dumps(card).encode(), json.dumps(metadata).encode()
 
+def _agent_card_url(upstream_url: str) -> str:
+    return upstream_url.rstrip("/") + "/.well-known/agent-card.json"
+
+def _build_a2a_metadata(spec_name: str, asset_id: str, upstream_url: str) -> bytes:
+    metadata = {
+        "protocol": "a2a",
+        "platform": "mulesoft",
+        "description": f"ODA Canvas A2A Agent — {spec_name}",
+        "connections": [
+            {
+                "name": asset_id,
+                "url": upstream_url,
+            }
+        ],
+    }
+    return json.dumps(metadata).encode()
 
 def _fetch_spec_content(url: str) -> tuple:
     """Fetch OAS spec bytes from URL. Returns (content, filename) or (None, None)."""
     try:
-        resp = _requests.get(url, timeout=10)
+        resp = _requests.get(url, timeout=10, verify=VERIFY_UPSTREAM_TLS,)
         resp.raise_for_status()
         filename = url.split("/")[-1] or "spec.yaml"
+        logger.info(
+            "Fetched spec content from %s status=%s bytes=%s",
+            url,
+            resp.status_code,
+            len(resp.content),
+        )
         return resp.content, filename
     except Exception as e:
-        logger.warning("Could not fetch OAS spec from %s: %s", url, e)
+        logger.warning("Could not fetch spec from %s: %s", url, e)
         return None, None
 
 def _has_flex_template(spec, **_):
@@ -458,6 +481,17 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
 
     # ── Resolve upstream URL through existing Canvas/Istio exposure ────────────────
     upstream_url = _resolve_upstream_url(spec, name)
+    # ── Create API instance (idempotent) ───────────────────────────────────────
+    endpoint_type = _ENDPOINT_TYPE.get(api_spec["apiType"], "http")
+    exchange_type = _EXCHANGE_TYPE.get(api_spec["apiType"], "rest-api")
+    exchange_asset_id = f"{name}-{api_spec['apiType']}"
+    if api_spec["apiType"] == "openapi" and not specification_url:
+        logger.warning("[%s] No OAS spec URL — publishing Exchange asset as http-api", name)
+        exchange_type = "http-api"
+
+    desired_state["exchangeAssetId"] = exchange_asset_id
+    desired_state["exchangeType"] = exchange_type
+    desired_state["endpointType"] = endpoint_type
 
     desired_state["upstreamUrl"] = upstream_url
     logger.info(
@@ -535,19 +569,33 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
     # ── Ensure Flex Gateway ────────────────────────────────────────────────────
     gw_id, gw_public_url = _ensure_gateway(anypoint)
 
-    # ── Create API instance (idempotent) ───────────────────────────────────────
-    endpoint_type = _ENDPOINT_TYPE.get(api_spec["apiType"], "http")
-    exchange_type = _EXCHANGE_TYPE.get(api_spec["apiType"], "rest-api")
-
     # ── Publish Exchange asset (idempotent) ────────────────────────────────────
-    if not anypoint.exchange_asset_exists(name):
+    if not anypoint.exchange_asset_exists(exchange_asset_id):
         a2a_card = a2a_meta = None
         oas_content = oas_filename = None
 
         if api_spec["apiType"] == "a2a":
-            a2a_card, a2a_meta = _build_a2a_card(
-                api_spec["name"], name, upstream_url
-            )
+            card_url = (_agent_card_url(upstream_url))
+            logger.info("[%s] Fetching A2A agent card from %s", name, card_url)
+            a2a_card, _ = _fetch_spec_content(card_url)
+
+            if a2a_card:
+                card = json.loads(a2a_card.decode("utf-8"))
+                card["version"] = str(card.get("version", "1.0.0")).lstrip("v")
+                if card["version"].isdigit():
+                    card["version"] = f"{card['version']}.0.0"
+                a2a_card = json.dumps(card).encode("utf-8")
+                a2a_meta = _build_a2a_metadata(api_spec["name"], exchange_asset_id, upstream_url)
+                logger.info("[%s] Using discovered A2A agent card: %s", name, card_url)
+            else:
+                logger.warning("[%s] Agent Card not available yet, retrying [%s]", name, card_url)
+                #a2a_card, a2a_meta = _build_a2a_card(
+                #    api_spec["name"], exchange_asset_id, upstream_url
+                #)
+                raise kopf.TemporaryError(
+                    f"A2A agent card not available yet at {card_url}",
+                    delay=30,
+                )
         elif api_spec["apiType"] == "openapi":
             spec_url = spec.get("specification", {}).get("url") if spec.get("specification") else None
             if spec_url:
@@ -555,11 +603,12 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
             if not oas_content:
                 logger.warning("[%s] No OAS spec available — falling back to http-api Exchange type", name)
                 exchange_type = "http-api"
+                desired_state["exchangeType"] = exchange_type
 
         try:
             status_url = anypoint.publish_exchange_asset(
                 name=api_spec["name"],
-                asset_id=name,
+                asset_id=exchange_asset_id,
                 exchange_type=exchange_type,
                 a2a_card=a2a_card,
                 agent_metadata=a2a_meta,
@@ -567,15 +616,15 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
                 oas_filename=oas_filename,
             )
             anypoint.wait_for_exchange_publish(status_url)
-            logger.info("[OK] Exchange asset published: %s (%s)", name, exchange_type)
+            logger.info("[OK] Exchange asset published: %s (%s)", exchange_asset_id, exchange_type)
         except Exception as e:
             raise kopf.TemporaryError(
                 f"Exchange publish failed for {name}: {e}", delay=30
             )
     else:
-        logger.info("[SKIP] Exchange asset exists: %s", name)
+        logger.info("[SKIP] Exchange asset exists: %s", exchange_asset_id)
 
-    existing = anypoint.find_api_instance_by_label(name)
+    existing = anypoint.find_api_instance_by_label(name, asset_id=exchange_asset_id)
     if existing:
         api_id = existing["id"]
         logger.info("[SKIP] API instance exists: %s  id=%s", name, api_id)
@@ -587,7 +636,7 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
             upstream_url.endswith("/"),
         )
         api = anypoint.create_api_instance(
-            spec_asset_id=name,
+            spec_asset_id=exchange_asset_id,
             endpoint_uri=upstream_url,
             label=name,
             proxy_path=name,
@@ -598,6 +647,19 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
         logger.info("[OK] API instance created: %s  id=%s", name, api_id)
 
     # ── Deploy to gateway ──────────────────────────────────────────────────────
+    logger.info(
+        "[%s] Deploying to gateway: api_id=%s gateway_id=%s gateway_name=%s "
+        "exchangeAssetId=%s exchangeType=%s endpointType=%s upstreamUrl=%s apiPublicUrl=%s",
+        name,
+        api_id,
+        gw_id,
+        FLEX_GW_NAME,
+        exchange_asset_id,
+        exchange_type,
+        endpoint_type,
+        upstream_url,
+        f"{gw_public_url}/{name}",
+    )
     anypoint.deploy_to_gateway(api_id, gw_id, FLEX_GW_NAME)
 
     # ── Apply policies (template-driven) ──────────────────────────────────────    
@@ -653,6 +715,9 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
                 "templateRef":     template_ref,
                 "templateDigest":  template_digest,
                 "spec":            api_spec,
+                "exchangeAssetId": exchange_asset_id,
+                "exchangeType":    exchange_type,
+                "endpointType":    endpoint_type,
                 "desiredState":    desired_state,
             },
             "implementation": {"ready": True},
