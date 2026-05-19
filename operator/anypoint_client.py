@@ -483,10 +483,10 @@ class AnypointClient:
         #    ]
         if a2a_card and agent_metadata:
             files += [
-                ("files.agent-card.json",
-                ("agent-card.json", a2a_card, "application/json")),
+                ("files.a2a-card.json",
+                 ("a2a-card.json", a2a_card, "application/json")),
                 ("files.agent-metadata.json",
-                ("agent-metadata.json", agent_metadata, "application/json")),
+                 ("agent-metadata.json", agent_metadata, "application/json")),
             ]
         if oas_content and oas_filename:
             ext = oas_filename.lower()

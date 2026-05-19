@@ -584,6 +584,8 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
                 card["version"] = str(card.get("version", "1.0.0")).lstrip("v")
                 if card["version"].isdigit():
                     card["version"] = f"{card['version']}.0.0"
+                if "protocolVersion" not in card:
+                    card["protocolVersion"] = "0.3.0"
                 a2a_card = json.dumps(card).encode("utf-8")
                 a2a_meta = _build_a2a_metadata(api_spec["name"], exchange_asset_id, upstream_url)
                 logger.info("[%s] Using discovered A2A agent card: %s", name, card_url)
