@@ -2,30 +2,30 @@ replicaCount: 1
 
 image:
   repository: "akumartmf/apioperatorflexgateway"          # e.g. docker.io/yourorg/flexgateway-operator
-  tag: "v0.11"
+  tag: "v0.18"
   pullPolicy: IfNotPresent
 
 # Anypoint credentials — stored in a K8s Secret
 anypointSecret:
   name: flexgateway-anypoint-creds
-  clientId: "eea....................."
-  clientSecret: "477....................."
+  clientId: "eea6dbb1dab241f5b5b4b79813bfefac"
+  clientSecret: "47771464bDF1466B8CA3f1bd495b28a6"
 
 # Operator configuration — all values required, set per deployment
 operator:
-  anypointOrgId: "0b2ebc55...................." 
-  anypointEnvId: "cbc85e......................"
+  anypointOrgId: "0b2ebc55-7316-4085-acd3-4372984c7997"
+  anypointEnvId: "cbc85e62-80a8-43fb-8150-2b25a2441b6c"
   anypointHost: "anypoint.mulesoft.com"        # anypoint.mulesoft.com | eu1.anypoint.mulesoft.com | ca1.anypoint.mulesoft.com | jp1.anypoint.mulesoft.com
-  flexGwTargetId: "3e81818....................."      # CloudHub 2.0 Private Space target ID
+  flexGwTargetId: "3e818183-78c3-4632-ab17-daaee2c4746d"      # CloudHub 2.0 Private Space target ID
   flexGwName: "oda-canvas-local-gw"          # Name of the pre-provisioned Managed Flex Gateway
-  keycloakJwksUrl: "<host.name>:8083/auth/realms/odari/protocol/openid-connect/certs"     # Canvas Keycloak JWKS endpoint
+  keycloakJwksUrl: "http://a072da6cf763a45f4bfd2752fe8b5b96-1681059276.ap-south-1.elb.amazonaws.com:8083/auth/realms/odari/protocol/openid-connect/certs"     # Canvas Keycloak JWKS endpoint
   keycloakAudience: "oda-canvas-gateway"    # JWT aud claim value
   logging: "INFO"
   istioIngressHost: ""    # Override Istio discovery for local testing — leave empty in production
   istioSecretName: "istio-ingress-cert"    # Optional: name of K8s Secret containing TLS certs for Istio ingress
   istioSecretNamespace: "istio-ingress"   # Namespace of the above Secret
   gatewayTlsSecretName: "flexgateway-canvas-tls"  # Optional: name of Anypoint Secret containing TLS certs for the gateway — required if the operator manages TLS for the gateway
-
+  verifyUpstreamTls: "false" # Set to false for dev environments with self-signed certs
 # Policy templates — define which policies to apply per apiType.
 # Edit these values or patch the ConfigMap directly after deployment.
 # If the ConfigMap is deleted, the operator falls back to built-in defaults.
