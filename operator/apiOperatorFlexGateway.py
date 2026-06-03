@@ -376,12 +376,7 @@ def _build_a2a_metadata(spec_name: str, asset_id: str, upstream_url: str) -> byt
         "protocol": "a2a",
         "platform": "mulesoft",
         "description": f"ODA Canvas A2A Agent — {spec_name}",
-        "connections": [
-            {
-                "name": asset_id,
-                "url": upstream_url,
-            }
-        ],
+        "connections": [],
     }
     return json.dumps(metadata).encode()
 
@@ -569,60 +564,71 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
     # ── Ensure Flex Gateway ────────────────────────────────────────────────────
     gw_id, gw_public_url = _ensure_gateway(anypoint)
 
-    # ── Publish Exchange asset (idempotent) ────────────────────────────────────
-    if not anypoint.exchange_asset_exists(exchange_asset_id):
-        a2a_card = a2a_meta = None
-        oas_content = oas_filename = None
+    # ── Fetch Exchange content (card/spec) ────────────────────────────────────
+    a2a_card = a2a_meta = None
+    oas_content = oas_filename = None
 
-        if api_spec["apiType"] == "a2a":
-            card_url = (_agent_card_url(upstream_url))
-            logger.info("[%s] Fetching A2A agent card from %s", name, card_url)
-            a2a_card, _ = _fetch_spec_content(card_url)
+    if api_spec["apiType"] == "a2a":
+        card_url = _agent_card_url(upstream_url)
+        logger.info("[%s] Fetching A2A agent card from %s", name, card_url)
+        a2a_card, _ = _fetch_spec_content(card_url)
 
-            if a2a_card:
-                card = json.loads(a2a_card.decode("utf-8"))
-                card["version"] = str(card.get("version", "1.0.0")).lstrip("v")
-                if card["version"].isdigit():
-                    card["version"] = f"{card['version']}.0.0"
-                a2a_card = json.dumps(card).encode("utf-8")
-                a2a_meta = _build_a2a_metadata(api_spec["name"], exchange_asset_id, upstream_url)
-                logger.info("[%s] Using discovered A2A agent card: %s", name, card_url)
-            else:
-                logger.warning("[%s] Agent Card not available yet, retrying [%s]", name, card_url)
-                #a2a_card, a2a_meta = _build_a2a_card(
-                #    api_spec["name"], exchange_asset_id, upstream_url
-                #)
-                raise kopf.TemporaryError(
-                    f"A2A agent card not available yet at {card_url}",
-                    delay=30,
-                )
-        elif api_spec["apiType"] == "openapi":
-            spec_url = spec.get("specification", {}).get("url") if spec.get("specification") else None
-            if spec_url:
-                oas_content, oas_filename = _fetch_spec_content(spec_url)
-            if not oas_content:
-                logger.warning("[%s] No OAS spec available — falling back to http-api Exchange type", name)
-                exchange_type = "http-api"
-                desired_state["exchangeType"] = exchange_type
+        if a2a_card:
+            card = json.loads(a2a_card.decode("utf-8"))
+            card["version"] = str(card.get("version", "1.0.0")).lstrip("v")
+            if card["version"].isdigit():
+                card["version"] = f"{card['version']}.0.0"
+            if "protocolVersion" not in card:
+                card["protocolVersion"] = "0.3.0"
+            a2a_card = json.dumps(card).encode("utf-8")
+            a2a_meta = _build_a2a_metadata(api_spec["name"], exchange_asset_id, upstream_url)
+            logger.info("[%s] Using discovered A2A agent card: %s", name, card_url)
+        else:
+            logger.warning("[%s] Agent Card not available yet, retrying [%s]", name, card_url)
+            raise kopf.TemporaryError(
+                f"A2A agent card not available yet at {card_url}",
+                delay=30,
+            )
+    elif api_spec["apiType"] == "openapi":
+        spec_url = spec.get("specification", {}).get("url") if spec.get("specification") else None
+        if spec_url:
+            oas_content, oas_filename = _fetch_spec_content(spec_url)
+        if not oas_content:
+            logger.warning("[%s] No OAS spec available — falling back to http-api Exchange type", name)
+            exchange_type = "http-api"
+            desired_state["exchangeType"] = exchange_type
 
+    # ── Publish Exchange asset (content-aware) ────────────────────────────────
+    exchange_content = a2a_card or oas_content or b""
+    exchange_content_hash = hashlib.sha256(exchange_content).hexdigest()
+    stored_content_hash = status.get("flexGatewayBind", {}).get("exchangeContentHash")
+    asset_exists = anypoint.exchange_asset_exists(exchange_asset_id)
+
+    if not asset_exists or exchange_content_hash != stored_content_hash:
+        if asset_exists and exchange_content_hash != stored_content_hash:
+            logger.info("[%s] Exchange content changed (hash %s → %s) — publishing new version",
+                       name, (stored_content_hash or "none")[:8], exchange_content_hash[:8])
+        exchange_version = anypoint.get_next_exchange_version(exchange_asset_id)
         try:
             status_url = anypoint.publish_exchange_asset(
                 name=api_spec["name"],
                 asset_id=exchange_asset_id,
                 exchange_type=exchange_type,
+                version=exchange_version,
                 a2a_card=a2a_card,
                 agent_metadata=a2a_meta,
                 oas_content=oas_content,
                 oas_filename=oas_filename,
             )
             anypoint.wait_for_exchange_publish(status_url)
-            logger.info("[OK] Exchange asset published: %s (%s)", exchange_asset_id, exchange_type)
+            logger.info("[OK] Exchange asset published: %s v%s (%s)", exchange_asset_id, exchange_version, exchange_type)
         except Exception as e:
             raise kopf.TemporaryError(
                 f"Exchange publish failed for {name}: {e}", delay=30
             )
     else:
-        logger.info("[SKIP] Exchange asset exists: %s", exchange_asset_id)
+        exchange_version = "1.0.0"
+        logger.info("[SKIP] Exchange asset unchanged: %s (hash=%s)", exchange_asset_id, exchange_content_hash[:8])
 
     existing = anypoint.find_api_instance_by_label(name, asset_id=exchange_asset_id)
     if existing:
@@ -637,6 +643,7 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
         )
         api = anypoint.create_api_instance(
             spec_asset_id=exchange_asset_id,
+            spec_version=exchange_version,
             endpoint_uri=upstream_url,
             label=name,
             proxy_path=name,
@@ -715,9 +722,11 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
                 "templateRef":     template_ref,
                 "templateDigest":  template_digest,
                 "spec":            api_spec,
-                "exchangeAssetId": exchange_asset_id,
-                "exchangeType":    exchange_type,
-                "endpointType":    endpoint_type,
+                "exchangeAssetId":     exchange_asset_id,
+                "exchangeType":       exchange_type,
+                "exchangeVersion":    exchange_version,
+                "exchangeContentHash": exchange_content_hash,
+                "endpointType":       endpoint_type,
                 "desiredState":    desired_state,
             },
             "implementation": {"ready": True},

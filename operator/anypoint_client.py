@@ -435,13 +435,48 @@ class AnypointClient:
     # Exchange
     # ------------------------------------------------------------------
 
-    def exchange_asset_exists(self, asset_id: str, version: str = "1.0.0") -> bool:
-        """Return True if the asset already exists in Exchange (idempotency check)."""
+    def exchange_asset_exists(self, asset_id: str, version: str = None) -> bool:
+        """Return True if any version of this asset exists in Exchange."""
+        if version:
+            path = f"{self._base}/exchange/api/v2/assets/{self.org_id}/{asset_id}/{version}"
+        else:
+            path = f"{self._base}/exchange/api/v2/assets/{self.org_id}/{asset_id}"
+        resp = requests.get(path, headers=self._headers)
+        return resp.status_code == 200
+
+    def get_next_exchange_version(self, asset_id: str) -> str:
+        """
+        Query Exchange for all versions of an asset and return the next
+        available patch version. Handles soft-deleted versions by bumping
+        past them if publish returns 409.
+        """
         resp = requests.get(
-            f"{self._base}/exchange/api/v2/assets/{self.org_id}/{asset_id}/{version}",
+            f"{self._base}/exchange/api/v2/assets/{self.org_id}/{asset_id}",
             headers=self._headers,
         )
-        return resp.status_code == 200
+        if resp.status_code == 404:
+            return "1.0.0"
+
+        resp.raise_for_status()
+        versions = resp.json().get("versions", [])
+
+        if not versions:
+            return "1.0.0"
+
+        max_patch = -1
+        for v in versions:
+            ver = v.get("version", "0.0.0")
+            parts = ver.split(".")
+            if len(parts) == 3 and parts[0] == "1" and parts[1] == "0":
+                try:
+                    max_patch = max(max_patch, int(parts[2]))
+                except ValueError:
+                    pass
+
+        next_version = f"1.0.{max_patch + 1}" if max_patch >= 0 else "1.0.0"
+        logger.info("Exchange version for %s: latest published=%s next=%s",
+                    asset_id, f"1.0.{max_patch}" if max_patch >= 0 else "none", next_version)
+        return next_version
 
     def publish_exchange_asset(
         self,
@@ -483,10 +518,10 @@ class AnypointClient:
         #    ]
         if a2a_card and agent_metadata:
             files += [
-                ("files.agent-card.json",
-                ("agent-card.json", a2a_card, "application/json")),
+                ("files.a2a-card.json",
+                 ("a2a-card.json", a2a_card, "application/json")),
                 ("files.agent-metadata.json",
-                ("agent-metadata.json", agent_metadata, "application/json")),
+                 ("agent-metadata.json", agent_metadata, "application/json")),
             ]
         if oas_content and oas_filename:
             ext = oas_filename.lower()
@@ -505,11 +540,29 @@ class AnypointClient:
                 ("properties.mainFile",   (None, oas_filename)),
             ]
         resp = requests.post(url, headers=self._auth_header, files=files)
+
+        # Handle soft-deleted version conflict — bump and retry once
+        if resp.status_code == 409 and "deleted asset" in resp.text.lower():
+            parts = version.split(".")
+            bumped = f"{parts[0]}.{parts[1]}.{int(parts[2]) + 1}"
+            logger.warning(
+                "Exchange version %s is soft-deleted for %s — bumping to %s",
+                version, asset_id, bumped,
+            )
+            bumped_url = (
+                f"{self._base}/exchange/api/v2/organizations/{self.org_id}"
+                f"/assets/{self.org_id}/{asset_id}/{bumped}"
+            )
+            # Update version in files list
+            files = [(k, v) for k, v in files if k != "properties.apiVersion"]
+            files.append(("properties.apiVersion", (None, bumped)))
+            resp = requests.post(bumped_url, headers=self._auth_header, files=files)
+
         if not resp.ok:
             logger.error("Exchange publish failed %s: %s", resp.status_code, resp.text)
         resp.raise_for_status()
         status_url = resp.json()["publicationStatusLink"]
-        logger.info("Exchange publish submitted: %s (%s)", asset_id, exchange_type)
+        logger.info("Exchange publish submitted: %s v%s (%s)", asset_id, version, exchange_type)
         return status_url
 
     def wait_for_exchange_publish(
