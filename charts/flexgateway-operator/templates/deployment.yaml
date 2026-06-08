@@ -45,15 +45,23 @@ spec:
               value: {{ .Values.operator.keycloakAudience | quote }}
             - name: ISTIO_INGRESS_HOST
               value: {{ .Values.operator.istioIngressHost | quote }}
-            - name: ISTIO_SECRET_NAME
-              value: {{ .Values.operator.istioSecretName | quote }}
-            - name: ISTIO_SECRET_NAMESPACE
-              value: {{ .Values.operator.istioSecretNamespace | quote }}
-            - name: GATEWAY_TLS_SECRET_NAME
-              value: {{ .Values.operator.gatewayTlsSecretName | quote }}
+            - name: UPSTREAM_TLS_MODE
+              value: {{ .Values.operator.upstreamTlsMode | quote }}
+            - name: ISTIO_CERT_PATH
+              value: {{ .Values.operator.istioCertPath | quote }}
+            - name: UPSTREAM_TLS_SECRET_GROUP
+              value: {{ .Values.operator.upstreamTlsSecretGroup | quote }}
             - name: OPERATOR_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: VERIFY_UPSTREAM_TLS
               value: {{ .Values.operator.verifyUpstreamTls | quote }}
             - name: LOGGING
               value: {{ .Values.operator.logging | quote }}
+          volumeMounts:
+            - name: istio-ingress-cert
+              mountPath: /etc/istio-certs
+              readOnly: true
+      volumes:
+        - name: istio-ingress-cert
+          secret:
+            secretName: istio-ingress-cert

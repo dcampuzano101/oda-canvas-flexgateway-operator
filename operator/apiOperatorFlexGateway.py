@@ -35,10 +35,14 @@ FLEX_GW_TARGET_ID      = os.environ["FLEX_GW_TARGET_ID"]
 FLEX_GW_NAME           = os.environ["FLEX_GW_NAME"]
 KEYCLOAK_JWKS_URL      = os.environ["KEYCLOAK_JWKS_URL"]
 KEYCLOAK_AUDIENCE      = os.environ["KEYCLOAK_AUDIENCE"]
-ISTIO_SECRET_NAME      = os.environ.get("ISTIO_SECRET_NAME")
-ISTIO_SECRET_NAMESPACE = os.environ.get("ISTIO_SECRET_NAMESPACE", "istio-ingress")
-GATEWAY_TLS_SECRET_NAME = os.environ.get("GATEWAY_TLS_SECRET_NAME")
-MANAGE_OUTBOUND_TLS     = bool(ISTIO_SECRET_NAME and GATEWAY_TLS_SECRET_NAME)
+UPSTREAM_TLS_MODE      = os.environ.get("UPSTREAM_TLS_MODE")
+ISTIO_CERT_PATH        = os.environ.get("ISTIO_CERT_PATH")
+UPSTREAM_TLS_SECRET_GROUP = os.environ.get(
+    "UPSTREAM_TLS_SECRET_GROUP",
+    "flexgateway-canvas-tls",
+)
+
+_UPSTREAM_TLS_CONTEXT   = None
 VERIFY_UPSTREAM_TLS     = os.environ.get("VERIFY_UPSTREAM_TLS", "false").lower() == "true"
         
 logging_level = os.environ.get("LOGGING", "INFO")
@@ -209,10 +213,39 @@ def _condition_met(condition: str, api_spec: dict) -> bool:
         val = val.get(key)
     return bool(val)
 
+def _normalize_exchange_version(raw_version: str | None) -> str:
+    if not raw_version:
+        return "1.0.0"
+
+    value = str(raw_version).strip().lower().lstrip("v")
+
+    if value.isdigit():
+        return f"{value}.0.0"
+
+    parts = value.split(".")
+    if len(parts) == 1:
+        return f"{parts[0]}.0.0"
+    if len(parts) == 2:
+        return f"{parts[0]}.{parts[1]}.0"
+
+    return value
+
+
+def _version_from_oas_content(oas_content: bytes | None) -> str | None:
+    if not oas_content:
+        return None
+
+    try:
+        parsed = _yaml.safe_load(oas_content)
+        return parsed.get("info", {}).get("version")
+    except Exception:
+        return None
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 @kopf.on.startup()
 def configure(settings: kopf.OperatorSettings, **_):
+    global _UPSTREAM_TLS_CONTEXT
+
     settings.watching.server_timeout = 60
 
     settings.persistence.finalizer = "oda.tmforum.org/flexgateway-operator-finalizer"
@@ -223,6 +256,19 @@ def configure(settings: kopf.OperatorSettings, **_):
         prefix="flexgateway.oda.tmforum.org",
         key="last-handled-configuration",
     )
+
+    if UPSTREAM_TLS_MODE:
+        anypoint = _build_client()
+        anypoint.authenticate()
+        _UPSTREAM_TLS_CONTEXT = anypoint.setup_upstream_tls(
+            mode=UPSTREAM_TLS_MODE,
+            secret_group_name=UPSTREAM_TLS_SECRET_GROUP,
+            cert_path=ISTIO_CERT_PATH,
+        )
+        logger.info("Upstream TLS context configured with mode=%s secret_group=%s cert_path=%s",
+                    UPSTREAM_TLS_MODE, UPSTREAM_TLS_SECRET_GROUP, ISTIO_CERT_PATH)
+    else:
+        logger.info("UPSTREAM_TLS_MODE not set, skipping upstream TLS configuration")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -272,13 +318,18 @@ def _resolve_upstream_url(spec: dict, name: str) -> str:
         raise kopf.TemporaryError("No Istio ingressgateway external IP found", delay=30)
 
     path = spec.get("path") or "/"
-    upstream_url = _join_url("https", istio_host, path, trailing_slash=True)
+    api_type = (spec.get("apiType") or "").lower()
+
+    trailing_slash = api_type == "a2a"
+
+    upstream_url = _join_url("https", istio_host, path, trailing_slash=trailing_slash)
 
     logger.info(
-        "[%s] Upstream URL resolution: istio_host=%s path=%r trailing_slash=True upstream_url=%r endswith_slash=%s",
+        "[%s] Upstream URL resolution: istio_host=%s path=%r trailing_slash=%s upstream_url=%r endswith_slash=%s",
         name,
         istio_host,
         path,
+        trailing_slash,
         upstream_url,
         upstream_url.endswith("/"),
     )
@@ -488,7 +539,14 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
     desired_state["exchangeType"] = exchange_type
     desired_state["endpointType"] = endpoint_type
 
+    desired_state["upstreamTlsMode"] = UPSTREAM_TLS_MODE or ""
+    desired_state["upstreamTlsSecretGroup"] = UPSTREAM_TLS_SECRET_GROUP if UPSTREAM_TLS_MODE else ""
+    desired_state["upstreamTlsContextId"] = (
+        _UPSTREAM_TLS_CONTEXT.get("tlsContextId") if _UPSTREAM_TLS_CONTEXT else ""
+    )
     desired_state["upstreamUrl"] = upstream_url
+    desired_state["tlsContextApplied"] = bool(_UPSTREAM_TLS_CONTEXT)
+    desired_state["tlsContextApplyMode"] = "xapi-upstream-update" if _UPSTREAM_TLS_CONTEXT else ""
     logger.info(
         "[%s] Desired upstreamUrl set: %r endswith_slash=%s",
         name,
@@ -567,6 +625,7 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
     # ── Fetch Exchange content (card/spec) ────────────────────────────────────
     a2a_card = a2a_meta = None
     oas_content = oas_filename = None
+    exchange_version = "1.0.0"
 
     if api_spec["apiType"] == "a2a":
         card_url = _agent_card_url(upstream_url)
@@ -597,24 +656,56 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
             logger.warning("[%s] No OAS spec available — falling back to http-api Exchange type", name)
             exchange_type = "http-api"
             desired_state["exchangeType"] = exchange_type
+            exchange_version = _normalize_exchange_version(
+                spec.get("specification", {}).get("version")
+            )
+        else:
+            exchange_version = _normalize_exchange_version(
+                _version_from_oas_content(oas_content)
+                or spec.get("specification", {}).get("version")
+            )
 
     # ── Publish Exchange asset (content-aware) ────────────────────────────────
     exchange_content = a2a_card or oas_content or b""
     exchange_content_hash = hashlib.sha256(exchange_content).hexdigest()
     stored_content_hash = status.get("flexGatewayBind", {}).get("exchangeContentHash")
+    api_version = None
     asset_exists = anypoint.exchange_asset_exists(exchange_asset_id)
 
-    if not asset_exists or exchange_content_hash != stored_content_hash:
+    if exchange_type == "http-api":
+        exchange_version = "1.0.0"
+        api_version = _normalize_exchange_version(
+            spec.get("specification", {}).get("version") or "1.0.0"
+        )
+    elif exchange_type == "rest-api":
+        exchange_version = anypoint.get_next_exchange_version(exchange_asset_id)
+        api_version = _normalize_exchange_version(
+            _version_from_oas_content(oas_content)
+            or spec.get("specification", {}).get("version")
+        )
+    else:
+        exchange_version = anypoint.get_next_exchange_version(exchange_asset_id)
+
+    should_publish = (
+        not asset_exists
+        or (
+            exchange_type != "http-api"
+            and exchange_content_hash != stored_content_hash
+        )
+    )
+
+    if should_publish:
         if asset_exists and exchange_content_hash != stored_content_hash:
             logger.info("[%s] Exchange content changed (hash %s → %s) — publishing new version",
                        name, (stored_content_hash or "none")[:8], exchange_content_hash[:8])
-        exchange_version = anypoint.get_next_exchange_version(exchange_asset_id)
+
         try:
             status_url = anypoint.publish_exchange_asset(
                 name=api_spec["name"],
                 asset_id=exchange_asset_id,
                 exchange_type=exchange_type,
                 version=exchange_version,
+                api_version=api_version,
                 a2a_card=a2a_card,
                 agent_metadata=a2a_meta,
                 oas_content=oas_content,
@@ -627,13 +718,31 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
                 f"Exchange publish failed for {name}: {e}", delay=30
             )
     else:
-        exchange_version = "1.0.0"
+        exchange_version = (
+            status.get("flexGatewayBind", {}).get("exchangeVersion")
+            or exchange_version
+        )
         logger.info("[SKIP] Exchange asset unchanged: %s (hash=%s)", exchange_asset_id, exchange_content_hash[:8])
 
     existing = anypoint.find_api_instance_by_label(name, asset_id=exchange_asset_id)
     if existing:
         api_id = existing["id"]
         logger.info("[SKIP] API instance exists: %s  id=%s", name, api_id)
+        # ── Deploy to gateway ──────────────────────────────────────────────────────
+#        logger.info(
+#            "[%s] Deploying to gateway: api_id=%s gateway_id=%s gateway_name=%s "
+#            "exchangeAssetId=%s exchangeType=%s endpointType=%s upstreamUrl=%s apiPublicUrl=%s",
+#            name,
+#            api_id,
+#            gw_id,
+#            FLEX_GW_NAME,
+#            exchange_asset_id,
+#            exchange_type,
+#            endpoint_type,
+#            upstream_url,
+#            f"{gw_public_url}/{name}",
+#        )
+#        anypoint.deploy_to_gateway(api_id, gw_id, FLEX_GW_NAME)
     else:
         logger.info(
             "[%s] Creating API instance with endpoint_uri=%r endpoint_uri_endswith_slash=%s",
@@ -641,33 +750,43 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
             upstream_url,
             upstream_url.endswith("/"),
         )
-        api = anypoint.create_api_instance(
+        api = anypoint.create_api_instance_xapi(
             spec_asset_id=exchange_asset_id,
             spec_version=exchange_version,
             endpoint_uri=upstream_url,
             label=name,
             proxy_path=name,
             gateway_url=gw_public_url,
+            gateway_id=gw_id,
+            gateway_name=FLEX_GW_NAME,
             endpoint_type=endpoint_type,
+            upstream_tls=_UPSTREAM_TLS_CONTEXT,
         )
         api_id = api["id"]
-        logger.info("[OK] API instance created: %s  id=%s", name, api_id)
+        logger.info("[OK] API instance created and deployed: %s  id=%s", name, api_id)
 
-    # ── Deploy to gateway ──────────────────────────────────────────────────────
-    logger.info(
-        "[%s] Deploying to gateway: api_id=%s gateway_id=%s gateway_name=%s "
-        "exchangeAssetId=%s exchangeType=%s endpointType=%s upstreamUrl=%s apiPublicUrl=%s",
-        name,
-        api_id,
-        gw_id,
-        FLEX_GW_NAME,
-        exchange_asset_id,
-        exchange_type,
-        endpoint_type,
-        upstream_url,
-        f"{gw_public_url}/{name}",
-    )
-    anypoint.deploy_to_gateway(api_id, gw_id, FLEX_GW_NAME)
+    api_details = anypoint.get_api_instance(api_id)
+
+    if _UPSTREAM_TLS_CONTEXT:
+        try:
+            updated_api = anypoint.update_api_instance_upstream_tls(
+                api_id=api_id,
+                api_details=api_details,
+                upstream_url=upstream_url,
+                tls_context=_UPSTREAM_TLS_CONTEXT,
+            )
+            logger.info(
+                "[%s] Upstream TLS context attached through xapi update for API %s",
+                name,
+                api_id,
+            )
+        except Exception as e:
+            raise kopf.TemporaryError(
+                f"Failed to attach upstream TLS context for {name}: {e}",
+                delay=30,
+            )
+    else:
+        logger.info("[%s] No upstream TLS context configured; skipping upstream TLS binding", name)
 
     # ── Apply policies (template-driven) ──────────────────────────────────────    
     policies_applied = []
@@ -727,6 +846,9 @@ def manage_exposedapi(spec, name, namespace, status, old=None, new=None, **kwarg
                 "exchangeVersion":    exchange_version,
                 "exchangeContentHash": exchange_content_hash,
                 "endpointType":       endpoint_type,
+                "upstreamTlsMode": UPSTREAM_TLS_MODE or "",
+                "tlsContextApplied": bool(_UPSTREAM_TLS_CONTEXT),
+                "tlsContextApplyMode": "xapi-upstream-update" if _UPSTREAM_TLS_CONTEXT else "",
                 "desiredState":    desired_state,
             },
             "implementation": {"ready": True},
