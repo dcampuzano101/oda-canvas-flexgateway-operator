@@ -1,0 +1,35 @@
+{
+  "name": "Slice Selling Agent",
+  "description": "AI-powered agent for customer requirement assessment, providing relevant 5G network slice product options and managing the negotiation lifecycle.",
+  "url": "https://oda-canvas-local-gw-s3s33e.5v7v1g.usa-e2.cloudhub.io/slice-selling-agent/v1/agent/a2a",
+  "protocolVersion": "0.3.0",
+  "version": "1.0.0",
+  "defaultInputModes": ["text/plain", "application/json"],
+  "defaultOutputModes": ["text/plain", "application/json"],
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false,
+    "stateTransitionHistory": false
+  },
+  "skills": [
+    {
+      "id": "slice-offering-query",
+      "name": "Slice Offering Query",
+      "description": "Assess customer connectivity requirements and recommend appropriate 5G network slice offerings based on bandwidth, latency, and coverage needs.",
+      "tags": ["5g", "network-slicing", "product-catalog", "b2b"]
+    },
+    {
+      "id": "slice-negotiation",
+      "name": "Slice Negotiation",
+      "description": "Manage the B2B negotiation lifecycle for network slice contracts including SLA terms, pricing, and coverage parameters.",
+      "tags": ["negotiation", "contract", "sla", "b2b"]
+    }
+  ],
+  "metadata": {
+    "componentName": "slice-selling-agent",
+    "protocol": "a2a",
+    "canvas": true,
+    "agentId": "slice-selling-agent-poc",
+    "domain": "network-slicing"
+  }
+}
