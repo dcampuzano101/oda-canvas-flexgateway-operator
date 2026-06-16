@@ -23,6 +23,24 @@
       "name": "Slice Negotiation",
       "description": "Manage the B2B negotiation lifecycle for network slice contracts including SLA terms, pricing, and coverage parameters.",
       "tags": ["negotiation", "contract", "sla", "b2b"]
+    },
+    {
+      "id": "slice-sla-validation",
+      "name": "SLA Validation",
+      "description": "Validate proposed SLA parameters against available network capacity, coverage maps, and existing commitments before contract finalization.",
+      "tags": ["sla", "validation", "capacity", "coverage"]
+    },
+    {
+      "id": "slice-pricing-optimization",
+      "name": "Pricing Optimization",
+      "description": "Generate optimized pricing recommendations based on customer segment, usage patterns, contract duration, and competitive positioning.",
+      "tags": ["pricing", "optimization", "revenue", "b2b"]
+    },
+    {
+      "id": "slice-upsell-recommendation",
+      "name": "Upsell Recommendation",
+      "description": "Identify upsell opportunities based on current slice utilization, customer growth trajectory, and available premium service tiers.",
+      "tags": ["upsell", "growth", "premium", "monetization"]
     }
   ],
   "metadata": {
